@@ -27,7 +27,7 @@ GAP_MS = 1000  # ms gap between consecutive pairs
 MAX_STIM_DURATION_MS = 60000  # ms total stimulation duration
 
 # Delay values to sweep
-SEQ_DELAY_MS_LIST = [5] #[0, 5, 10, 20, 30, 40, 50, 100, 200, 300]  # ms
+SEQ_DELAY_MS_LIST = [15] #[0, 5, 10, 15, 20, 30, 40, 50, 100, 200, 300]  # ms
 
 PRESIM_TIME_MS = sim_dict["t_presim"]
 SIM_TIME_MS = sim_dict["t_sim"]

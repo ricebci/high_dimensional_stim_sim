@@ -10,7 +10,7 @@ network during class construction, and exposes:
 
 Example
 -------
-    from run_system_nest_sim import SystemNESTSim
+    from system import SystemNESTSim
 
     sim = SystemNESTSim(output_name="system_experiment")
 
@@ -23,13 +23,13 @@ Example
 
     # Orientation input over time: [cos(theta), sin(theta)]
     visual_series = [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-    sim.visual_stim(visual_series, input_duration_ms=3000, dt_ms=10)
+    sim.visual_stim(visual_series)
 """
 
 import copy
 import os
 import pickle
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import nest
 import numpy as np
@@ -106,6 +106,8 @@ class SystemNESTSim:
         window_ms: int = 500,
         overlap_ms: int = 400,
         stim_pulse_params: Dict[str, float] = None,
+        fast_mode: bool = False,
+        fast_sim_resolution_ms: Optional[float] = None,
     ):
         """
         Initialize NEST and set up the network.
@@ -114,6 +116,14 @@ class SystemNESTSim:
         - resets NEST kernel
         - creates/connects network
         - runs pre-simulation baseline (`t_presim`)
+
+        Parameters
+        ----------
+        fast_mode
+            If True, use a coarser simulation resolution for faster iteration.
+        fast_sim_resolution_ms
+            Optional override for simulation resolution when fast_mode is True.
+            Defaults to 1.0 ms if not provided.
         """
         self.window_ms = window_ms
         self.overlap_ms = overlap_ms
@@ -122,6 +132,16 @@ class SystemNESTSim:
         self.net_dict = copy.deepcopy(net_dict)
         self.sim_dict = copy.deepcopy(sim_dict)
         self.stim_dict = copy.deepcopy(stim_dict)
+
+        if fast_mode:
+            fast_resolution = (
+                float(fast_sim_resolution_ms)
+                if fast_sim_resolution_ms is not None
+                else 1.0
+            )
+            if fast_resolution <= 0:
+                raise ValueError("fast_sim_resolution_ms must be > 0")
+            self.sim_dict["sim_resolution"] = fast_resolution
 
         nest.ResetKernel()
 
@@ -145,11 +165,21 @@ class SystemNESTSim:
         self.network.connect()
         self.network.simulate_baseline(self.sim_dict["t_presim"])
 
+        self._all_neurons = []
+        for pop in self.network.pops:
+            for neuron in pop:
+                self._all_neurons.append(neuron)
+        if len(self._all_neurons) != self.network.n_neurons:
+            raise RuntimeError("Mismatch between flattened neuron count and network.n_neurons")
+
+        self._impulse_response_cached = False
+
         print("SystemNESTSim initialized.")
         print("Total # neurons simulated:", self.network.n_neurons)
         print("Data path:", self.sim_dict["data_path"])
+        print("Simulation resolution (ms):", self.sim_dict["sim_resolution"])
 
-    def _validate_event_arrays(
+    def validate_event_arrays(
         self,
         channels: np.ndarray,
         times_ms: np.ndarray,
@@ -167,7 +197,45 @@ class SystemNESTSim:
         if np.any(times_ms > input_duration_ms):
             raise ValueError("Found stimulation times beyond input_duration_ms")
 
-    def _run_from_events(
+    @staticmethod
+    def get_current_biological_time_ms() -> float:
+        """Return current NEST biological time in ms."""
+        if hasattr(nest, "biological_time"):
+            return float(nest.biological_time)
+
+        try:
+            return float(nest.GetKernelStatus("biological_time"))
+        except Exception:
+            return float(nest.GetKernelStatus("time"))
+
+    def parse_stim_event_sequence(
+        self,
+        event_sequence: Dict[str, Iterable[float]],
+        *,
+        sort_by_time: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Parse an event-sequence dict into numpy arrays.
+
+        Expected keys: `channels`, `times_ms`, `amplitudes_uA`.
+        """
+        required_keys = ("channels", "times_ms", "amplitudes_uA")
+        missing_keys = [key for key in required_keys if key not in event_sequence]
+        if missing_keys:
+            raise KeyError(f"Missing keys in event_sequence: {missing_keys}")
+
+        channels = np.asarray(event_sequence["channels"], dtype=int)
+        times_ms = np.asarray(event_sequence["times_ms"], dtype=float)
+        amplitudes_uA = np.asarray(event_sequence["amplitudes_uA"], dtype=float)
+
+        if sort_by_time:
+            order = np.argsort(times_ms)
+            channels = channels[order]
+            times_ms = times_ms[order]
+            amplitudes_uA = amplitudes_uA[order]
+
+        return channels, times_ms, amplitudes_uA
+
+    def run_events(
         self,
         channels: np.ndarray,
         times_ms: np.ndarray,
@@ -180,7 +248,7 @@ class SystemNESTSim:
         times_ms = times_ms[order]
         amplitudes_uA = amplitudes_uA[order]
 
-        self._validate_event_arrays(channels, times_ms, amplitudes_uA, input_duration_ms)
+        self.validate_event_arrays(channels, times_ms, amplitudes_uA, input_duration_ms)
 
         build_stimulations_from_events(self.electrodes, channels, times_ms, amplitudes_uA)
 
@@ -216,6 +284,31 @@ class SystemNESTSim:
             "stim_pulses_path": pulses_path,
         }
 
+    def create_generators_from_channel_events(
+        self,
+        channels: np.ndarray,
+        absolute_times_ms: np.ndarray,
+        amplitudes_uA: np.ndarray,
+    ) -> List[Any]:
+        """Create per-neuron step current generators from channel-level events."""
+        if len(channels) == 0:
+            return []
+
+        build_stimulations_from_events(
+            self.electrodes,
+            channels,
+            absolute_times_ms,
+            amplitudes_uA,
+        )
+
+        if not self._impulse_response_cached:
+            self.electrodes.compute_impulse_response_matrix(self.network.neuron_locations)
+            self._impulse_response_cached = True
+
+        self.electrodes.compute_stim_current_matrix()
+        self.electrodes.calculate_induced_current_matrix()
+        return self.electrodes.get_current_generators()
+
     def electrical_stim(
         self,
         current_amplitude_sequence: Dict[str, Iterable[float]],
@@ -234,16 +327,12 @@ class SystemNESTSim:
         output_prefix
             Prefix used in output pickle filenames.
         """
-        required_keys = ("channels", "times_ms", "amplitudes_uA")
-        missing_keys = [key for key in required_keys if key not in current_amplitude_sequence]
-        if missing_keys:
-            raise KeyError(f"Missing keys in current_amplitude_sequence: {missing_keys}")
+        channels, times_ms, amplitudes_uA = self.parse_stim_event_sequence(
+            current_amplitude_sequence,
+            sort_by_time=False,
+        )
 
-        channels = np.asarray(current_amplitude_sequence["channels"], dtype=int)
-        times_ms = np.asarray(current_amplitude_sequence["times_ms"], dtype=float)
-        amplitudes_uA = np.asarray(current_amplitude_sequence["amplitudes_uA"], dtype=float)
-
-        return self._run_from_events(
+        return self.run_events(
             channels,
             times_ms,
             amplitudes_uA,
@@ -254,13 +343,15 @@ class SystemNESTSim:
     def visual_stim(
         self,
         orientation_time_series: Iterable[Iterable[float]],
-        input_duration_ms: float,
-        dt_ms: float = 1.0,
+        input_duration_ms: Optional[float] = None,
+        dt_ms: Optional[float] = None,
         baseline_pA: float = 0.0,
         gain_pA: float = 80.0,
         sparsity: float = 0.1,
         seed: int = 0,
         output_prefix: str = "visual",
+        realtime_progress: bool = False,
+        progress_step_ms: float = 1000.0,
     ) -> Dict[str, str]:
         """
         Run visual stimulation from orientation vectors [cos(theta), sin(theta)].
@@ -270,9 +361,11 @@ class SystemNESTSim:
         orientation_time_series
             Time-series shaped (T, 2), each row [cos(theta), sin(theta)].
         input_duration_ms
-            Total duration of this visual input.
+            Total duration of this visual input. If None, inferred as
+            `len(orientation_time_series) * dt_ms`.
         dt_ms
-            Time step between rows in the time-series.
+            Time step between rows in the time-series. If None, uses native
+            simulation resolution (`sim_dict["sim_resolution"]`).
         baseline_pA
             Baseline current (pA) delivered to selected visual-input neurons.
         gain_pA
@@ -283,22 +376,57 @@ class SystemNESTSim:
             Random seed for sparse-neuron and preference sampling.
         output_prefix
             Prefix used in output pickle filenames.
+        realtime_progress
+            If True, simulate in chunks and print progress updates.
+        progress_step_ms
+            Chunk size in ms for progress updates when realtime_progress is True.
         """
         orientation_array = np.asarray(orientation_time_series, dtype=float)
         if orientation_array.ndim != 2 or orientation_array.shape[1] != 2:
             raise ValueError("orientation_time_series must have shape (T, 2)")
+        if dt_ms is None:
+            dt_ms = float(self.sim_dict["sim_resolution"])
         if dt_ms <= 0:
             raise ValueError("dt_ms must be > 0")
         if not (0.0 < sparsity <= 1.0):
             raise ValueError("sparsity must be in (0, 1]")
+        if progress_step_ms <= 0:
+            raise ValueError("progress_step_ms must be > 0")
 
-        max_steps = int(np.floor(input_duration_ms / dt_ms)) + 1
+        if input_duration_ms is None:
+            input_duration_ms = float(len(orientation_array) * dt_ms)
+        if input_duration_ms <= 0:
+            raise ValueError("input_duration_ms must be > 0")
+
+        # Number of input samples expected at native / requested dt.
+        expected_steps = int(np.floor(float(input_duration_ms) / dt_ms))
+        if expected_steps <= 0:
+            raise ValueError("No simulation steps available for given input_duration_ms and dt_ms")
+
+        max_steps = expected_steps
         num_steps = min(len(orientation_array), max_steps)
         orientation_array = orientation_array[:num_steps]
 
-        event_times = np.arange(num_steps, dtype=float) * dt_ms
         if num_steps == 0:
             raise ValueError("orientation_time_series is empty after duration truncation")
+
+        # step_current_generator times are absolute biological times in NEST.
+        # Shift events to start after the current simulation time (post-presim).
+        current_time_ms = self.get_current_biological_time_ms()
+        time_offset_ms = max(float(nest.resolution), 1e-6)
+        event_times = (
+            current_time_ms + np.arange(num_steps, dtype=float) * dt_ms + time_offset_ms
+        )
+
+        # Keep only valid stimulation time points within this run's duration.
+        valid_mask = event_times <= (current_time_ms + float(input_duration_ms))
+        if not np.any(valid_mask):
+            raise ValueError(
+                "No valid event times remain within input_duration_ms after positive-time offset"
+            )
+        event_times = event_times[valid_mask]
+        orientation_array = orientation_array[valid_mask]
+        num_steps = len(event_times)
 
         rng = np.random.default_rng(seed)
         num_neurons = self.network.n_neurons
@@ -314,32 +442,50 @@ class SystemNESTSim:
             [np.cos(preferred_thetas), np.sin(preferred_thetas)],
             axis=1,
         )
-
         projections = orientation_array @ preferred_vectors.T
         target_currents = baseline_pA + gain_pA * projections
 
+        all_neurons = []
+        for pop in self.network.pops:
+            for neuron in pop:
+                all_neurons.append(neuron)
+
+        if len(all_neurons) != num_neurons:
+            raise RuntimeError("Mismatch between flattened neuron count and network.n_neurons")
+
         current_generators = []
-        empty_values = np.zeros(num_steps, dtype=float)
-
-        target_lookup = {idx: i for i, idx in enumerate(target_neuron_indices)}
-        for neuron_index in range(num_neurons):
-            if neuron_index in target_lookup:
-                amplitude_values = target_currents[:, target_lookup[neuron_index]]
-            else:
-                amplitude_values = empty_values
-
+        for i_target, neuron_index in enumerate(target_neuron_indices):
+            amplitude_values = target_currents[:, i_target]
             generator = nest.Create(
                 "step_current_generator",
                 params={
-                    "label": f"visual_input_neuron_{neuron_index}",
+                    "label": f"visual_input_neuron_{int(neuron_index)}",
                     "amplitude_times": event_times,
                     "amplitude_values": amplitude_values,
                 },
             )
             current_generators.append(generator)
+            nest.Connect(generator, all_neurons[int(neuron_index)])
 
-        self.network.simulate_current_input(current_generators, time_ms=float(input_duration_ms))
+        total_duration_ms = float(input_duration_ms)
+        if realtime_progress:
+            simulated_ms = 0.0
+            print('Inside realtime_progress')
+            while simulated_ms < total_duration_ms:
+                chunk_ms = min(progress_step_ms, total_duration_ms - simulated_ms)
+                print('Chunk duration', chunk_ms)
+                nest.Simulate(chunk_ms)
+                simulated_ms += chunk_ms
+                print(
+                    f"Visual sim progress: {simulated_ms:.0f}/{total_duration_ms:.0f} ms "
+                    f"(biological time {self.get_current_biological_time_ms():.1f} ms)",
+                    flush=True,
+                )
+        else:
+            print('Total duration', total_duration_ms)
+            nest.Simulate(total_duration_ms)
 
+        print('Simulation over', flush=True)
         spike_trains = self.network.get_spike_train_list()
         spike_rates = helpers.compute_spike_rates(
             spike_trains,
@@ -370,6 +516,7 @@ class SystemNESTSim:
             f"Visual input targeted {num_target_neurons}/{num_neurons} neurons "
             f"(sparsity={sparsity:.3f})"
         )
+        print(f"Created {len(current_generators)} visual current generators")
 
         return {
             "spike_rates_path": rates_path,

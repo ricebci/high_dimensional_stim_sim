@@ -33,7 +33,7 @@ sim_dict = {
     # simulation time.
     # presimulation time (in ms)
     # 1s should be enough
-    "t_presim": 1000,
+    "t_presim": 1000, #1000,
     # simulation time (in ms)
     "t_sim": 60000.0,
     # resolution of the simulation (in ms)

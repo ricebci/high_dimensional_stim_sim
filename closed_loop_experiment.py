@@ -74,22 +74,29 @@ def run_closed_loop_electrical_stim(
     output_prefix: str = "closed_loop",
     realtime_progress: bool = True,
 ) -> Dict[str, str]:
+    # Validate duration parameters
     if total_duration_ms <= 0:
         raise ValueError("total_duration_ms must be > 0")
     if closed_loop_interval_ms <= 0:
         raise ValueError("closed_loop_interval_ms must be > 0")
 
+    # Record simulation starting point (after presim) and network size
     loop_start_bio_ms = sim.get_current_biological_time_ms()
     n_neurons = sim.network.n_neurons
 
+    # Snapshot current spike counts so we can detect new spikes each interval
     spike_trains = sim.network.get_spike_train_list()
     prev_spike_counts = np.array([len(train) for train in spike_trains], dtype=int)
-
+    
+    # This is where model and conotrller should affect the loop
+    
+    # Set up loop iteration state
     n_intervals = int(np.ceil(total_duration_ms / closed_loop_interval_ms))
     pending_pattern = initial_stim_pattern
     history = []
 
     for interval_index in range(n_intervals):
+        # Compute relative and absolute timing for this interval
         interval_start_ms = interval_index * closed_loop_interval_ms
         interval_duration_ms = min(
             closed_loop_interval_ms,
@@ -98,6 +105,7 @@ def run_closed_loop_electrical_stim(
         interval_end_ms = interval_start_ms + interval_duration_ms
         abs_interval_start_ms = loop_start_bio_ms + interval_start_ms
 
+        # Deliver pending stim pattern (if any) and advance simulation
         delivered = None
         if pending_pattern is not None:
             channels, times_ms, amplitudes_uA = sim.parse_stim_event_sequence(
@@ -128,8 +136,10 @@ def run_closed_loop_electrical_stim(
                 "amplitudes_uA": amplitudes_uA,
             }
         else:
+            # No stim this interval; just advance the simulation
             nest.Simulate(float(interval_duration_ms))
 
+        # Extract new spikes since last interval for each neuron
         spike_trains = sim.network.get_spike_train_list()
         new_spikes_by_neuron = []
         for neuron_index in range(n_neurons):
@@ -139,6 +149,7 @@ def run_closed_loop_electrical_stim(
             new_spikes_rel = new_spikes_abs - loop_start_bio_ms
             new_spikes_by_neuron.append(new_spikes_rel)
 
+        # Ask controller whether to stimulate in the next interval
         pending_pattern = controller(
             interval_index=interval_index,
             interval_start_ms=interval_start_ms,
@@ -148,6 +159,7 @@ def run_closed_loop_electrical_stim(
             history=history,
         )
 
+        # Log this interval's outcome
         history.append(
             {
                 "interval_index": interval_index,
@@ -165,6 +177,7 @@ def run_closed_loop_electrical_stim(
                 flush=True,
             )
 
+    # Compute windowed spike rates over the full closed-loop duration
     spike_trains = sim.network.get_spike_train_list()
     spike_rates = helpers.compute_spike_rates(
         spike_trains,
@@ -174,6 +187,7 @@ def run_closed_loop_electrical_stim(
         presim_time_ms=sim.sim_dict["t_presim"],
     )
 
+    # Save spike rates and history to disk
     rates_path = os.path.join(sim.sim_dict["data_path"], f"{output_prefix}_spike_rates.pkl")
     history_path = os.path.join(sim.sim_dict["data_path"], f"{output_prefix}_history.pkl")
 
@@ -195,12 +209,14 @@ def main():
     args = parse_args()
     validate_args(args)
 
+    # Initialize NEST network (includes presim warmup)
     sim = SystemNESTSim(
         output_name=args.output_name,
         fast_mode=args.fast_mode,
         fast_sim_resolution_ms=args.fast_sim_resolution_ms,
     )
 
+    # Build feedback controller that decides when to stimulate
     controller = SpikeThresholdController(
         stim_channels=args.stim_channels,
         stim_amplitude_uA=args.stim_amplitude_uA,
@@ -209,6 +225,7 @@ def main():
         refractory_intervals=args.refractory_intervals,
     )
 
+    # Run the closed-loop experiment
     results = run_closed_loop_electrical_stim(
         sim=sim,
         total_duration_ms=args.total_duration_ms,
@@ -219,6 +236,7 @@ def main():
         realtime_progress=not args.no_progress,
     )
 
+    # Save full experiment configuration for reproducibility
     config = {
         "total_duration_ms": args.total_duration_ms,
         "closed_loop_interval_ms": args.closed_loop_interval_ms,

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
+import torch
 
 import numpy as np
 
@@ -68,3 +69,15 @@ class SpikeThresholdController:
             "times_ms": times_ms,
             "amplitudes_uA": amplitudes_uA,
         }
+
+
+
+class TCNN(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, previous_history, stimulation): 
+        ''' Model predicts next state given previous history and stimulation pattern'''
+        pass
+
+    

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import logging
 from typing import Dict, Iterable, Optional
 import torch
 
@@ -71,13 +72,49 @@ class SpikeThresholdController:
         }
 
 
+class EncoderRepertoire:
+    """
+    Using a given encoder model, stores a large set of possible stimulations and their predicted responses,
+    and greedily selects one-step stimulation that is closest to target response state. 
+    """
 
-class TCNN(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, encoder, max_len=100000):
+        self.encoder = encoder
+        self.repertoire = pl.DataFrame(columns=["state", "stim_pattern", "pred_response"])
+        self.max_len = max_len
 
-    def forward(self, previous_history, stimulation): 
-        ''' Model predicts next state given previous history and stimulation pattern'''
-        pass
+    def fit_stim_repertoire(self, initial_states, stim_patterns):
+        for state, pattern in zip(initial_states, stim_patterns):
+            if len(self.repertoire) > 0: # TODO: decide how repertoire clash should be handled
+                if self.repertoire["state"] and self.repertoire["stim_pattern"]:
+                    # if same initial state and stim pattern is already in repertoire, skip
+                    continue
+            if len(self.repertoire) >= self.max_len:
+                logging.warning("Repertoire has reached max length, stopping further fitting")
+                break
+            pred_response = self.encoder.predict(state, pattern)
+            # Store (state, pattern, pred_response) in repertoire (e.g. as a list or dict)
+            self.repertoire = self.repertoire.append({
+                "state": state,
+                "stim_pattern": pattern,
+                "pred_response": pred_response
+            }, ignore_index=True)
+        return None
 
+
+    def get_stim_pattern(self, target) -> Optional[Dict[str, Iterable[float]]]:
+        # Find the stim_pattern in repertoire whose pred_response is closest to target
+        # Return that stim_pattern
+        if len(self.repertoire) == 0:
+            return None
+        
+        self.repertoire["distance"] = self.repertoire["pred_response"].apply(lambda x: np.linalg.norm(x - target, ord=2))
+        best_row = self.repertoire.loc[self.repertoire["distance"].idxmin()]
+        return best_row["stim_pattern"]
     
+    def __call__(self, *args, **kwds):
+            if "target" not in kwds:
+                raise ValueError("target keyword argument is required")
+            return self.get_stim_pattern(kwds["target"])
+            
+        

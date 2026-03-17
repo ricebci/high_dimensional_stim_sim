@@ -215,7 +215,8 @@ class StimElectrodes:
             [self.stimulations[ch]["times"] for ch in np.arange(M)]
         )
 
-        rounded_all_times = np.round(all_times, decimals=5)
+        resolution = float(nest.GetKernelStatus("resolution"))
+        rounded_all_times = np.round(all_times / resolution) * resolution
         self.unique_timestamps = np.unique(rounded_all_times)
         self.unique_timestamps = self.unique_timestamps[self.unique_timestamps > 0]
 
@@ -226,7 +227,7 @@ class StimElectrodes:
 
         for ch in range(M):
             # Round and find the indices in `unique_timestamps`
-            ch_times = np.round(self.stimulations[ch]["times"], decimals=5)
+            ch_times = np.round(np.asarray(self.stimulations[ch]["times"]) / resolution) * resolution
             ch_amplitudes = np.array(self.stimulations[ch]["amplitudes"]) / UA2PA
 
             # Get the corresponding indices in the unique timestamps array

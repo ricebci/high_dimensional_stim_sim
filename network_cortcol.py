@@ -166,6 +166,15 @@ class Network:
         self.simulation_time_ms = time_ms
         nest.Simulate(time_ms)
 
+        # Remove generators so they don't accumulate across closed-loop intervals.
+        nest.Disconnect(
+            input_currents,
+            nest.NodeCollection(
+                [neuron.global_id for pop in self.pops for neuron in pop]
+            ),
+        )
+        nest.Remove(input_currents)
+
     def get_spktrains(self):
         sd_names, node_ids, data = helpers.load_spike_times(
             self.data_path, "spike_recorder", 0, np.inf

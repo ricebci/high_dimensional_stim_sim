@@ -657,6 +657,10 @@ def compute_spike_rates(
 
     """
     step_ms = window_ms - overlap_ms
+    if sim_time_ms < window_ms:
+        window_ms = sim_time_ms
+        overlap_ms = 0
+        step_ms = window_ms
     num_windows = int(np.floor((sim_time_ms - window_ms) / step_ms)) + 1
     num_neurons = len(spike_trains)
     windows = np.linspace(0, sim_time_ms - window_ms, num_windows)

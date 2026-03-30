@@ -443,12 +443,13 @@ def _load_spike_trains_from_dat(
     data_path: str, presim_ms: float
 ) -> list:
     """Load spike recorder .dat files into a list of per-neuron spike arrays."""
-    spike_files = sorted(glob.glob(os.path.join(data_path, "spike_recorder-*.dat")))
+    sd_dir = os.path.join(data_path, "spike_recorder")
+    spike_files = sorted(glob.glob(os.path.join(sd_dir, "spike_recorder-*.dat")))
     if not spike_files:
-        raise FileNotFoundError(f"No spike_recorder files in {data_path}")
+        raise FileNotFoundError(f"No spike_recorder files in {sd_dir}")
 
     node_ids = np.loadtxt(
-        os.path.join(data_path, "population_nodeids.dat"), dtype=int
+        os.path.join(sd_dir, "population_nodeids.dat"), dtype=int
     )
     if node_ids.ndim == 1:
         node_ids = node_ids[None, :]
@@ -486,9 +487,6 @@ def _load_spike_trains_from_dat(
 class StimEncodingCNN(nn.Module):
     """Causal 1-D CNN mapping binned stim amplitudes to log spike rates.
 
-    Architecture mirrors ``SimpleCausalSpikeCNN`` from the reference
-    codebase but replaces the categorical embedding with a linear
-    projection, since stimulation amplitudes are continuous.
 
     Supports two convolution modes controlled by ``use_init_state``:
 
@@ -640,7 +638,6 @@ def get_model(model_type: str, **kwargs) -> nn.Module:
     """
     models = {
         "cnn": StimEncodingCNN,
-        "history_cnn": HistoryStimEncodingCNN,
     }
     if model_type not in models:
         raise ValueError(
@@ -708,15 +705,9 @@ def train_epoch(
         bx, by = bx.to(device), by.to(device)
         optimizer.zero_grad()
 
-        if use_history and isinstance(model, HistoryStimEncodingCNN):
-            stim_input = bx[:, : model.n_stim_channels, :]
-            pred = model(stim_input, spike_context=by, mode="teacher_forcing")
-        else:
-            pred = model(bx)
+        pred = model(bx)
 
-        # Align output length to target length
-        T_out = min(pred.shape[2], by.shape[2])
-        loss = poisson_nll_loss(pred[:, :, :T_out], by[:, :, :T_out])
+        loss = poisson_nll_loss(pred, by)
         loss.backward()
         optimizer.step()
 
@@ -742,15 +733,7 @@ def evaluate(
     for bx, by in loader:
         bx, by = bx.to(device), by.to(device)
 
-        if use_history and isinstance(model, HistoryStimEncodingCNN):
-            stim_input = bx[:, : model.n_stim_channels, :]
-            pred = model(stim_input, spike_context=by, mode="teacher_forcing")
-        else:
-            pred = model(bx)
-
-        T_out = min(pred.shape[2], by.shape[2])
-        pred = pred[:, :, :T_out]
-        by = by[:, :, :T_out]
+        pred = model(bx)
 
         total_loss += poisson_nll_loss(pred, by).item()
         all_pred.append(pred.cpu())

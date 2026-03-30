@@ -24,7 +24,7 @@ for current in currents:
     end = sim_dict["t_sim"] + sim_dict["t_presim"]
 
     sd_names, node_ids, data = helpers.load_spike_times(
-        data_path, "spike_recorder", begin, end
+        os.path.join(data_path, "spike_recorder"), "spike_recorder", begin, end
     )
 
     # Need to get stim times for specific channel

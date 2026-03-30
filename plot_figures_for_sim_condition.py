@@ -74,7 +74,7 @@ baseline_spike_rates = helpers.compute_spike_rates(
 
 fig, ax = plt.subplots(1, 1, figsize=(3, 2.25))
 helpers.plot_raster(
-    sim_dict["data_path"],
+    os.path.join(sim_dict["data_path"], "spike_recorder"),
     "spike_recorder",
     RASTER_INTERVAL[0],
     RASTER_INTERVAL[1],
@@ -120,7 +120,7 @@ for n_groups in N_GROUPS_LIST:
     fig, axes = plt.subplots(2, 1, figsize=(3, 4))
     plot_title = f"{n_groups} electrode group{'s' if n_groups > 1 else ''}"
     helpers.plot_raster(
-        sim_dict["data_path"],
+        os.path.join(sim_dict["data_path"], "spike_recorder"),
         "spike_recorder",
         RASTER_INTERVAL[0],
         RASTER_INTERVAL[1],

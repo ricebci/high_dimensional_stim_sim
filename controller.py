@@ -75,29 +75,22 @@ class SpikeThresholdController:
 
 class RepertoireController:
     """
-    Closed-loop controller using a StimEncodingCNN to predict neural responses
-    and select stimulation patterns that drive the network toward a target state.
-
-    Maintains a rolling buffer of binned (bin_ms-wide) spike counts and stim
-    amplitudes.  Since closed_loop_interval_ms == bin_ms, each simulation
-    interval corresponds to exactly one model bin.
-
-    Every n_repertoire_update_ms of simulated time the repertoire is updated
-    with new (state, stim) observations collected since the last update.
+    Closed-loop controller that greedily selects stimulation patterns from a
+    fixed repertoire by running the encoding model on each candidate with the
+    current neural state and choosing the one whose predicted next state is
+    closest (L2) to the target.
 
     Parameters
     ----------
     model : StimEncodingCNN
     meta : dict
-        Checkpoint metadata from meta.pt.
+        Checkpoint metadata (meta.json / meta.pt).
     target : np.ndarray, shape (n_neurons,)
-        Desired mean-over-time log-rate per neuron. The controller selects the
-        stim pattern whose predicted response is closest (L2) to this target.
+        Desired mean-over-time log-rate per neuron.
     max_len : int
-        Maximum number of repertoire entries.
-    n_repertoire_update_ms : float
-        How often (ms of simulated time) to add cached observations to the
-        repertoire.
+        Maximum number of patterns stored in the repertoire.
+    batch_size : int
+        Number of candidate patterns to evaluate per forward pass.
     device : str
         Torch device string, e.g. 'cpu', 'mps', 'cuda'.
     """
@@ -107,96 +100,141 @@ class RepertoireController:
         model,
         meta: dict,
         target: np.ndarray,
+        pca_components: np.ndarray,
+        pca_mean: np.ndarray,
         max_len: int = 100_000,
-        n_repertoire_update_ms: float = 10_000.0,
+        batch_size: int = 256,
         device: str = "cpu",
+        random_stim_prob: float = 0.0,
+        n_relevant_output_bins: Optional[int] = None,
+        **kwargs,   # absorb deprecated kwargs (e.g. n_repertoire_update_ms)
     ):
         self.model = model
         self.model.eval()
         self.device = device
         self.target = np.asarray(target, dtype=np.float32)
         self.max_len = max_len
-        self.n_repertoire_update_ms = n_repertoire_update_ms
+        self.batch_size = batch_size
+
+        # PCA projection into 2D orientation-tuning space for distance metric.
+        # Components shape: (n_components, n_neurons); mean shape: (n_neurons,).
+        # Both are in Hz firing-rate units; model predictions are exponentiated
+        # to Hz before projection (see get_stim_pattern).
+        self.pca_components = np.asarray(pca_components, dtype=np.float32)  # (K, N)
+        self.pca_mean       = np.asarray(pca_mean,       dtype=np.float32)  # (N,)
+        # Pre-project the target into PC space so we don't recompute it every call.
+        self._target_pc = (self.target - self.pca_mean) @ self.pca_components.T  # (K,)
 
         self.n_stim_channels: int = meta["n_stim_channels"]
         self.n_neurons: int = meta["n_neurons"]
         self.n_input_bins: int = meta["n_input_bins"]
-        self.n_output_bins: int = meta["n_output_bins"]
         self.bin_ms: float = float(meta["bin_ms"])
         self.history: int = meta.get("history", 0)
         self.kernel_sizes: List[int] = meta.get("kernel_sizes", [3, 3])
         self.total_conv_reduction: int = sum(k - 1 for k in self.kernel_sizes)
         self.n_total_bins: int = self.n_input_bins + self.total_conv_reduction
 
-        # Rolling buffers — spike_buf[:, -1] is the most recently completed bin
+        # Rolling buffers for current neural context
         self.spike_buf = np.zeros((self.n_neurons, self.n_total_bins), dtype=np.float32)
-        self.stim_buf = np.zeros((self.n_stim_channels, self.n_total_bins), dtype=np.float32)
+        self.stim_buf  = np.zeros((self.n_stim_channels, self.n_total_bins), dtype=np.float32)
 
-        # Repertoire: list of {"stim_pattern": dict, "pred_response_mean": (n_neurons,)}
+        self.random_stim_prob: float = float(random_stim_prob)
+        # Only the output bin at index (n_relevant_output_bins - 1) is used when
+        # scoring candidates.  Set to ceil(interval_ms / bin_ms); None = last bin.
+        self.n_relevant_output_bins: Optional[int] = n_relevant_output_bins
+
+        # Repertoire: list of {channels, times_ms, amplitudes_uA} dicts
         self._entries: List[Dict] = []
 
-        # Observation cache: (spike_buf_snap, stim_buf_snap, stim_pattern_dict)
-        # captured each time the controller returns a non-None stim pattern
-        self._obs_cache: List[Tuple[np.ndarray, np.ndarray, Dict]] = []
-        self._last_update_ms: float = 0.0
+        # Amplitudes and max active bins observed in training — used for random exploration.
+        self._seen_amplitudes: np.ndarray = np.array([], dtype=np.float32)
+        self._max_active_bins: int = 1
+
+        # Model input used for the most recently selected pattern (for fine-tuning).
+        self._last_selected_input: Optional[np.ndarray] = None
+        # Set to True when the last returned pattern was randomly explored.
+        self._last_was_random: bool = False
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_model_input(self, candidate_stim_bins: np.ndarray) -> torch.Tensor:
-        """
-        Construct the (1, C, T) model input from current buffer + candidate stim.
+    def _stim_dict_to_bins(self, stim_dict: Optional[Dict]) -> np.ndarray:
+        """Convert a stim pattern dict → (n_stim_channels, n_input_bins) array."""
+        bins = np.zeros((self.n_stim_channels, self.n_input_bins), dtype=np.float32)
+        if stim_dict is None or len(stim_dict.get("channels", [])) == 0:
+            return bins
+        chs  = np.asarray(stim_dict["channels"],      dtype=int)
+        ts   = np.asarray(stim_dict["times_ms"],       dtype=float)
+        amps = np.asarray(stim_dict["amplitudes_uA"], dtype=float)
+        b    = np.floor(ts / self.bin_ms).astype(int)
+        n_deliver = self.n_relevant_output_bins if self.n_relevant_output_bins is not None else self.n_input_bins
+        mask = (b >= 0) & (b < n_deliver) & (chs >= 0) & (chs < self.n_stim_channels)
+        np.add.at(bins, (chs[mask], b[mask]), amps[mask])
+        return bins
 
-        candidate_stim_bins : (n_stim_channels, n_input_bins) float32
-            The proposed stimulation pattern binned at bin_ms resolution.
+    def _build_model_input(self, candidate_stim_bins: np.ndarray) -> np.ndarray:
         """
-        ctx = self.total_conv_reduction
-        n_total = self.n_total_bins  # == n_input_bins + ctx
+        Build a single (C, T) model input from the current rolling buffers plus
+        a candidate stim pattern.
 
-        # Stim input: past ctx bins of stim history + candidate stim
+        candidate_stim_bins : (n_stim_channels, n_input_bins)
+        """
+        ctx     = self.total_conv_reduction
+        n_total = self.n_total_bins
+
         x_stim = np.zeros((self.n_stim_channels, n_total), dtype=np.float32)
         if ctx > 0:
             x_stim[:, :ctx] = self.stim_buf[:, -ctx:]
         x_stim[:, ctx:] = candidate_stim_bins
 
         if self.history > 0:
-            # Spike history is lagged 1 bin relative to stim in the training data:
-            # positions [0, ctx+1) are known past; positions [ctx+1, n_total) are
-            # future (unknown) → leave as zero.
             h = np.zeros((self.n_neurons, n_total), dtype=np.float32)
             known = ctx + 1
             h[:, :known] = self.spike_buf[:, -known:]
-            x = np.concatenate([x_stim, h], axis=0)
-        else:
-            x = x_stim
+            return np.concatenate([x_stim, h], axis=0)   # (C+N, T)
+        return x_stim   # (C, T)
 
-        return torch.from_numpy(x).unsqueeze(0).to(self.device)  # (1, C, T)
+    def _ar_forward(self, inputs: np.ndarray) -> np.ndarray:
+        """Autoregressively run the model for n_relevant_output_bins steps.
 
-    @torch.no_grad()
-    def _predict_mean(self, x_tensor: torch.Tensor) -> np.ndarray:
-        """Run the model and return mean log-rate per neuron: (n_neurons,)."""
-        y = self.model(x_tensor)          # (1, n_neurons, n_output_bins)
-        return y[0].mean(dim=-1).cpu().numpy()
+        At step k, fills history channel at time (ctx+1+k) with the expected
+        spike count from the model's prediction at bin k, then proceeds to k+1.
 
-    def _stim_dict_to_bins(self, stim_dict: Optional[Dict]) -> np.ndarray:
-        """Convert {channels, times_ms, amplitudes_uA} → (n_stim_channels, n_input_bins)."""
-        bins = np.zeros((self.n_stim_channels, self.n_input_bins), dtype=np.float32)
-        if stim_dict is None or len(stim_dict.get("channels", [])) == 0:
-            return bins
-        chs = np.asarray(stim_dict["channels"], dtype=int)
-        ts = np.asarray(stim_dict["times_ms"], dtype=float)
-        amps = np.asarray(stim_dict["amplitudes_uA"], dtype=float)
-        b = np.floor(ts / self.bin_ms).astype(int)
-        mask = (b >= 0) & (b < self.n_input_bins) & (chs >= 0) & (chs < self.n_stim_channels)
-        np.add.at(bins, (chs[mask], b[mask]), amps[mask])
-        return bins
+        inputs : (N, C, T) — modified in-place; history slots are filled
+                 progressively so the returned prediction is fully AR-consistent.
+        Returns : (N, n_neurons) — prediction at bin (n_relevant_output_bins - 1).
+        """
+        N         = len(inputs)
+        n_steps   = self.n_relevant_output_bins or self.n_input_bins
+        ctx       = self.total_conv_reduction
+        n_stim_ch = self.n_stim_channels
+
+        final_pred = np.empty((N, self.n_neurons), dtype=np.float32)
+
+        with torch.no_grad():
+            for k in range(n_steps):
+                is_last = (k == n_steps - 1)
+                for start in range(0, N, self.batch_size):
+                    end = min(start + self.batch_size, N)
+                    y   = self.model(
+                        torch.from_numpy(inputs[start:end]).to(self.device)
+                    ).cpu().numpy()  # (B, n_neurons, n_out)
+                    if is_last:
+                        final_pred[start:end] = y[:, :, k]
+                    elif self.history > 0:
+                        # fill lag-1 history for the next step
+                        inputs[start:end, n_stim_ch:, ctx + 1 + k] = np.exp(
+                            np.clip(y[:, :, k], -10.0, 10.0)
+                        )
+
+        return final_pred  # (N, n_neurons)
 
     def _update_stim_buf_col(self, delivered: Optional[Dict]) -> np.ndarray:
-        """Build a stim amplitude column (n_stim_channels,) for the just-completed bin."""
+        """Summarise the just-delivered stim into a (n_stim_channels,) column."""
         col = np.zeros(self.n_stim_channels, dtype=np.float32)
         if delivered is not None and len(delivered.get("channels", [])) > 0:
-            chs = np.asarray(delivered["channels"], dtype=int)
+            chs  = np.asarray(delivered["channels"],      dtype=int)
             amps = np.asarray(delivered["amplitudes_uA"], dtype=float)
             valid = (chs >= 0) & (chs < self.n_stim_channels)
             np.add.at(col, chs[valid], amps[valid])
@@ -208,80 +246,161 @@ class RepertoireController:
 
     def fit_stim_repertoire(
         self,
-        model_inputs: List[np.ndarray],
+        model_inputs,           # unused — kept for API compatibility
         stim_patterns: List[Dict],
     ):
-        """
-        Seed the repertoire from pre-built model inputs and their stim pattern dicts.
+        """Store stimulation patterns from training data as the repertoire.
 
-        Parameters
-        ----------
-        model_inputs : list of (n_stim_channels + n_neurons, n_total_bins) float32 arrays
-            Already-formatted model input tensors (e.g. from a NESTStimSpikeDataset).
-        stim_patterns : list of {channels, times_ms, amplitudes_uA} dicts
-            The stimulation pattern corresponding to each model input.
+        If n_relevant_output_bins < n_input_bins (i.e. the closed-loop interval
+        is shorter than the training horizon), each training pattern is split
+        into sub-patterns of n_relevant_output_bins length.  Times within each
+        chunk are re-zeroed to the start of that chunk.  Duplicate patterns
+        (same channels/bins/amps tuple) are removed.
+
+        model_inputs is accepted but ignored; predictions are computed live
+        from the current neural state at call time.
         """
-        added = 0
-        for x_np, pattern in zip(model_inputs, stim_patterns):
-            if len(self._entries) >= self.max_len:
-                logging.warning("Repertoire at capacity (%d); stopping fit.", self.max_len)
-                break
-            x_t = torch.from_numpy(
-                np.asarray(x_np, dtype=np.float32)
-            ).unsqueeze(0).to(self.device)
-            pred_mean = self._predict_mean(x_t)
-            self._entries.append({"stim_pattern": pattern, "pred_response_mean": pred_mean})
-            added += 1
-        print(f"fit_stim_repertoire: added {added} entries (total {len(self._entries)}).")
+        n_deliver = self.n_relevant_output_bins if self.n_relevant_output_bins is not None else self.n_input_bins
+        window_ms = n_deliver * self.bin_ms
+
+        # Collect unique amplitudes and max event count for random exploration.
+        all_amps: set = set()
+        max_events: int = 0
+        for p in stim_patterns:
+            all_amps.update(float(a) for a in p.get("amplitudes_uA", []))
+            max_events = max(max_events, len(p.get("channels", [])))
+        self._seen_amplitudes = np.array(sorted(all_amps), dtype=np.float32)
+        self._max_active_bins = max(1, max_events)
+
+        if n_deliver >= self.n_input_bins:
+            # No splitting needed — use patterns as-is.
+            self._entries = list(stim_patterns[: self.max_len])
+        else:
+            n_chunks = self.n_input_bins // n_deliver  # integer number of non-overlapping windows
+            seen_keys: set = set()
+            expanded: List[Dict] = []
+            for p in stim_patterns:
+                chs  = np.asarray(p.get("channels",      []), dtype=int)
+                ts   = np.asarray(p.get("times_ms",      []), dtype=float)
+                amps = np.asarray(p.get("amplitudes_uA", []), dtype=float)
+                for chunk in range(n_chunks):
+                    t_start = chunk * window_ms
+                    t_end   = t_start + window_ms
+                    mask = (ts >= t_start) & (ts < t_end)
+                    if not np.any(mask):
+                        continue
+                    new_chs  = chs[mask]
+                    new_ts   = ts[mask] - t_start   # re-zero to chunk start
+                    new_amps = amps[mask]
+                    # Deduplicate via a hashable key: sorted (ch, bin, amp) tuples
+                    bins_i = np.floor(new_ts / self.bin_ms).astype(int)
+                    key = tuple(sorted(zip(new_chs.tolist(), bins_i.tolist(),
+                                          (new_amps * 100).round().astype(int).tolist())))
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    expanded.append({
+                        "channels":      new_chs.tolist(),
+                        "times_ms":      new_ts.tolist(),
+                        "amplitudes_uA": new_amps.tolist(),
+                    })
+                    if len(expanded) >= self.max_len:
+                        break
+                if len(expanded) >= self.max_len:
+                    break
+            self._entries = expanded
+
+        print(f"fit_stim_repertoire: stored {len(self._entries)} unique patterns "
+              f"(n_deliver_bins={n_deliver}, seen amps={self._seen_amplitudes.tolist()}, "
+              f"max_active_bins={self._max_active_bins}).")
+
+    def _random_stim_pattern(self) -> Optional[Dict]:
+        """Sample a random single-channel pattern for exploration.
+
+        Channel is drawn uniformly. Amplitude is drawn uniformly from the set
+        seen in training. Number of active bins is drawn uniformly from
+        [1, _max_active_bins]. Bin indices are drawn without replacement.
+        """
+        if len(self._seen_amplitudes) == 0:
+            return None
+        channel       = int(np.random.randint(0, self.n_stim_channels))
+        n_active      = int(np.random.randint(1, self._max_active_bins + 1))
+        # Restrict to bins that fall within the deliverable closed-loop window.
+        n_deliverable = self.n_relevant_output_bins or self.n_input_bins
+        n_active      = min(n_active, n_deliverable)
+        bins          = np.sort(np.random.choice(n_deliverable, size=n_active, replace=False))
+        amps      = np.random.choice(self._seen_amplitudes, size=n_active)
+        times_ms  = bins.astype(float) * self.bin_ms
+        return {
+            "channels":      [channel] * n_active,
+            "times_ms":      times_ms.tolist(),
+            "amplitudes_uA": amps.tolist(),
+        }
 
     # ------------------------------------------------------------------
-    # Retrieval
+    # Greedy selection
     # ------------------------------------------------------------------
 
     def get_stim_pattern(self) -> Optional[Dict]:
         """
-        Return the stim_pattern from the repertoire whose predicted mean response
-        is closest (L2) to self.target.  Returns None if the repertoire is empty.
+        For every pattern in the repertoire, build a model input using the
+        current rolling state, run the encoder, and return the pattern whose
+        predicted mean log-rate is closest (L2) to self.target — but only if
+        that pattern improves on the no-stimulation baseline prediction.
+        Returns None if the repertoire is empty or if no candidate reduces the
+        distance to the target compared to delivering no stimulation.
         """
         if not self._entries:
             return None
-        preds = np.stack([e["pred_response_mean"] for e in self._entries])  # (N, n_neurons)
-        dists = np.linalg.norm(preds - self.target[None, :], axis=1)
-        best = int(np.argmin(dists))
-        return self._entries[best]["stim_pattern"]
 
-    def at_capacity(self) -> bool:
-        return len(self._entries) >= self.max_len
+        # Random exploration: bypass the model with probability random_stim_prob.
+        # Still build and cache the model input so fine-tuning can pair it with
+        # the observed response on the next interval.
+        if self.random_stim_prob > 0.0 and np.random.random() < self.random_stim_prob:
+            pattern = self._random_stim_pattern()
+            if pattern is not None:
+                stim_bins = self._stim_dict_to_bins(pattern)
+                inp = self._build_model_input(stim_bins)[None].copy()  # (1, C, T)
+                self._ar_forward(inp)          # fills history slots in-place
+                self._last_selected_input = inp[0]
+                self._last_was_random = True
+                if len(self._entries) < self.max_len:
+                    self._entries.append(pattern)
+                return pattern
 
-    # ------------------------------------------------------------------
-    # Periodic repertoire update from cached observations
-    # ------------------------------------------------------------------
+        # Compute no-stim baseline distance in 2D PC space via AR forward
+        null_input = self._build_model_input(
+            np.zeros((self.n_stim_channels, self.n_input_bins), dtype=np.float32)
+        )[None].copy()                                         # (1, C, T)
+        null_pred    = self._ar_forward(null_input)[0]                        # (n_neurons,) log counts/bin
+        null_pred_hz = np.exp(null_pred) / self.bin_ms * 1000.0             # → Hz
+        null_pc      = (null_pred_hz - self.pca_mean) @ self.pca_components.T
+        no_stim_dist = float(np.linalg.norm(null_pc - self._target_pc))
 
-    def _flush_obs_cache(self):
-        """Add cached (state, stim) observations to the repertoire via the encoder."""
-        if not self._obs_cache:
-            return
-        added = 0
-        for spike_snap, stim_snap, pattern in self._obs_cache:
-            if self.at_capacity():
-                break
-            # Temporarily swap buffer to compute prediction from the snapshot state
-            saved_spike, saved_stim = self.spike_buf, self.stim_buf
-            self.spike_buf, self.stim_buf = spike_snap, stim_snap
+        # Build all candidate inputs and run AR forward (modifies inputs in-place)
+        inputs = np.stack(
+            [self._build_model_input(self._stim_dict_to_bins(p)) for p in self._entries]
+        )  # (N, C, T)
+        final_preds    = self._ar_forward(inputs)                           # (N, n_neurons) log counts/bin
+        final_preds_hz = np.exp(final_preds) / self.bin_ms * 1000.0        # → Hz
 
-            candidate_bins = self._stim_dict_to_bins(pattern)
-            x_t = self._build_model_input(candidate_bins)
-            pred_mean = self._predict_mean(x_t)
+        # Score in 2D PC space
+        preds_pc = (final_preds_hz - self.pca_mean[None, :]) @ self.pca_components.T  # (N, K)
+        dists    = np.linalg.norm(preds_pc - self._target_pc[None, :], axis=1)     # (N,)
+        best_idx  = int(np.argmin(dists))
+        best_dist = float(dists[best_idx])
 
-            self.spike_buf, self.stim_buf = saved_spike, saved_stim
+        # Only stimulate if the best candidate actually improves on doing nothing
+        if best_dist >= no_stim_dist:
+            self._last_selected_input = None
+            self._last_was_random = False
+            return None
 
-            self._entries.append({"stim_pattern": pattern, "pred_response_mean": pred_mean})
-            added += 1
-
-        logging.info(
-            "Repertoire update: added %d entries (total %d).", added, len(self._entries)
-        )
-        self._obs_cache.clear()
+        # inputs[best_idx] has its history slots filled up to step n_steps-2 —
+        # the AR-refined input appropriate for fine-tuning.
+        self._last_selected_input = inputs[best_idx]
+        self._last_was_random = False
+        return self._entries[best_idx]
 
     # ------------------------------------------------------------------
     # Standard closed-loop controller interface
@@ -300,42 +419,21 @@ class RepertoireController:
         **kwargs,
     ) -> Optional[Dict]:
         """
-        Update the rolling buffer, periodically refresh the repertoire, then
-        return the stim pattern to deliver in the next interval.
-
-        `delivered_pattern` should be the stim that was applied in the interval
-        that just ended (i.e. the pattern that caused `new_spikes_by_neuron`).
-        Pass it from the experiment loop for accurate stim-buffer tracking.
+        1. Advance the rolling spike/stim buffers with observations from the
+           interval that just finished.
+        2. Run the greedy repertoire search with the updated state.
+        3. Return the chosen stim pattern (or None if repertoire is empty).
         """
-        # --- Update rolling spike buffer ---
+        # Update rolling spike buffer
         spike_counts = np.array(
             [len(s) for s in new_spikes_by_neuron], dtype=np.float32
         )
         self.spike_buf = np.roll(self.spike_buf, -1, axis=1)
         self.spike_buf[:, -1] = spike_counts
 
-        # --- Update rolling stim buffer with what was just delivered ---
+        # Update rolling stim buffer with what was just delivered
         stim_col = self._update_stim_buf_col(delivered_pattern)
         self.stim_buf = np.roll(self.stim_buf, -1, axis=1)
         self.stim_buf[:, -1] = stim_col
 
-        # --- Periodic repertoire update ---
-        if (
-            interval_end_ms - self._last_update_ms >= self.n_repertoire_update_ms
-            and not self.at_capacity()
-        ):
-            self._flush_obs_cache()
-            self._last_update_ms = interval_end_ms
-
-        # --- Query repertoire ---
-        chosen = self.get_stim_pattern()
-
-        # --- Cache this observation for the next update round ---
-        if chosen is not None and not self.at_capacity():
-            self._obs_cache.append((
-                self.spike_buf.copy(),
-                self.stim_buf.copy(),
-                chosen,
-            ))
-
-        return chosen
+        return self.get_stim_pattern()

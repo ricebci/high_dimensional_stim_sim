@@ -281,19 +281,31 @@ class StimElectrodes:
         if np.any(self.unique_timestamps <= 0):
             raise ValueError("Non-positive timestamps detected!")
 
-        current_generators = [
-            nest.Create(
-                "step_current_generator",
-                params=dict(
-                    label=f"induced_current_at_neuron_{neuron_index}",
-                    amplitude_times=self.unique_timestamps,
-                    amplitude_values=self.induced_current_matrix[neuron_index, :],
-                ),
-            )
-            for neuron_index in range(num_neurons)
-        ]
+        if not hasattr(self, "_generators") or len(self._generators) != num_neurons:
+            # First call: create generators and store them for reuse.
+            self._generators = [
+                nest.Create(
+                    "step_current_generator",
+                    params=dict(
+                        label=f"induced_current_at_neuron_{neuron_index}",
+                        amplitude_times=self.unique_timestamps,
+                        amplitude_values=self.induced_current_matrix[neuron_index, :],
+                    ),
+                )
+                for neuron_index in range(num_neurons)
+            ]
+        else:
+            # Subsequent calls: update parameters in-place via SetStatus.
+            for neuron_index, gen in enumerate(self._generators):
+                nest.SetStatus(
+                    gen,
+                    {
+                        "amplitude_times": self.unique_timestamps,
+                        "amplitude_values": self.induced_current_matrix[neuron_index, :],
+                    },
+                )
 
-        return current_generators
+        return self._generators
 
     def plot_stim_raster(self, time_range_ms=None, ax=None, title=None):
         fontsize = 12

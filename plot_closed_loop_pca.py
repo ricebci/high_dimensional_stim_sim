@@ -74,11 +74,12 @@ def parse_args():
 
 def load_spikes(data_path, begin_ms, end_ms):
     """Load spike times and neuron indices from spike_recorder .dat files."""
-    spike_files = sorted(glob.glob(os.path.join(data_path, "spike_recorder-*.dat")))
+    sd_dir = os.path.join(data_path, "spike_recorder")
+    spike_files = sorted(glob.glob(os.path.join(sd_dir, "spike_recorder-*.dat")))
     if not spike_files:
-        raise FileNotFoundError(f"No spike_recorder files in {data_path}")
+        raise FileNotFoundError(f"No spike_recorder files in {sd_dir}")
 
-    node_ids = np.loadtxt(os.path.join(data_path, "population_nodeids.dat"), dtype=int)
+    node_ids = np.loadtxt(os.path.join(sd_dir, "population_nodeids.dat"), dtype=int)
     if node_ids.ndim == 1:
         node_ids = node_ids[None, :]
     last_node_id = node_ids[-1, -1]

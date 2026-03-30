@@ -437,12 +437,13 @@ class SystemNESTSim:
             replace=False,
         )
 
+        # for each neuron, assign a preferred theta and compute its projected response to the input orientation time-series
         preferred_thetas = rng.uniform(0.0, 2.0 * np.pi, size=num_target_neurons)
         preferred_vectors = np.stack(
             [np.cos(preferred_thetas), np.sin(preferred_thetas)],
             axis=1,
         )
-        projections = orientation_array @ preferred_vectors.T
+        projections = orientation_array @ preferred_vectors.T # visual stims @ preferred directions
         target_currents = baseline_pA + gain_pA * projections
 
         all_neurons = []
@@ -453,6 +454,7 @@ class SystemNESTSim:
         if len(all_neurons) != num_neurons:
             raise RuntimeError("Mismatch between flattened neuron count and network.n_neurons")
 
+        # Key line conecting assigned single-neuron preferred orientations to responses. 
         current_generators = []
         for i_target, neuron_index in enumerate(target_neuron_indices):
             amplitude_values = target_currents[:, i_target]
@@ -522,3 +524,131 @@ class SystemNESTSim:
             "spike_rates_path": rates_path,
             "stim_metadata_path": meta_path,
         }
+
+    def setup_visual_generators_from_metadata(
+        self,
+        metadata_path: str,
+    ) -> None:
+        """Recreate per-neuron visual current generators from a saved stim metadata file.
+
+        Loads ``target_neuron_indices`` and ``preferred_thetas`` from the pickle
+        written by :meth:`visual_stim`, creates one ``step_current_generator``
+        per target neuron with zero amplitude, and connects each to its neuron.
+
+        Each neuron has its own preferred orientation (``preferred_thetas``).
+        Amplitudes are set to zero here; call :meth:`update_visual_generators_for_orientation`
+        each closed-loop interval to inject the current for a chosen orientation.
+
+        Parameters
+        ----------
+        metadata_path
+            Path to the ``*_stim_metadata.pkl`` file saved by :meth:`visual_stim`.
+        """
+        with open(metadata_path, "rb") as f:
+            meta = pickle.load(f)
+
+        target_neuron_indices = meta["target_neuron_indices"]
+        preferred_thetas = meta["preferred_thetas"]
+
+        resolution = float(nest.GetKernelStatus("resolution"))
+        current_time_ms = self.get_current_biological_time_ms()
+        placeholder_time = np.array([current_time_ms + resolution])
+
+        all_neurons = [neuron for pop in self.network.pops for neuron in pop]
+        if len(all_neurons) != self.network.n_neurons:
+            raise RuntimeError("Mismatch between flattened neuron count and network.n_neurons")
+
+        self._visual_target_neuron_indices = target_neuron_indices
+        self._visual_preferred_thetas = preferred_thetas
+        self._visual_baseline_pA: float = 0.0
+        self._visual_gain_pA: float = 80.0
+        self._visual_generators = []
+
+        for i_target, neuron_index in enumerate(target_neuron_indices):
+            gen = nest.Create(
+                "step_current_generator",
+                params={
+                    "label": f"visual_input_neuron_{int(neuron_index)}",
+                    "amplitude_times": placeholder_time,
+                    "amplitude_values": [0.0],
+                },
+            )
+            self._visual_generators.append(gen)
+            nest.Connect(gen, all_neurons[int(neuron_index)])
+
+        print(
+            f"setup_visual_generators_from_metadata: "
+            f"{len(self._visual_generators)} generators connected "
+            f"(zero amplitude; call update_visual_generators_for_orientation each interval)"
+        )
+
+    def update_visual_generators_for_orientation(
+        self,
+        theta_deg: float,
+        interval_duration_ms: float,
+        baseline_pA: Optional[float] = None,
+        gain_pA: Optional[float] = None,
+        dt_ms: Optional[float] = None,
+    ) -> None:
+        """Update visual generator amplitudes for a given orientation and simulate.
+
+        Each neuron's amplitude is ``baseline + gain * dot(orient_vec, preferred_vec)``,
+        where ``preferred_vec`` is that neuron's stored preferred orientation from the
+        original visual_stim run.  The amplitudes are held constant across
+        ``interval_duration_ms``.
+
+        Parameters
+        ----------
+        theta_deg
+            Input orientation angle in degrees.
+        interval_duration_ms
+            Simulation duration for this interval.
+        baseline_pA, gain_pA
+            Override stored baseline/gain; if None, uses values from
+            :meth:`setup_visual_generators_from_metadata`.
+        dt_ms
+            Time step for amplitude events.  Defaults to simulation resolution.
+        """
+        if not hasattr(self, "_visual_generators"):
+            raise RuntimeError("Call setup_visual_generators_from_metadata first.")
+
+        if baseline_pA is None:
+            baseline_pA = self._visual_baseline_pA
+        if gain_pA is None:
+            gain_pA = self._visual_gain_pA
+        if dt_ms is None:
+            dt_ms = float(self.sim_dict["sim_resolution"])
+
+        resolution = float(nest.GetKernelStatus("resolution"))
+        current_time_ms = self.get_current_biological_time_ms()
+        time_offset_ms = max(resolution, 1e-6)
+
+        num_steps = max(1, int(round(interval_duration_ms / dt_ms)))
+        event_times = (
+            current_time_ms
+            + np.arange(num_steps, dtype=float) * dt_ms
+            + time_offset_ms
+        )
+        valid_mask = event_times <= current_time_ms + interval_duration_ms
+        event_times = event_times[valid_mask]
+        if len(event_times) == 0:
+            event_times = np.array([current_time_ms + time_offset_ms])
+        event_times = np.round(event_times / resolution) * resolution
+
+        theta = np.deg2rad(theta_deg)
+        orient_vec = np.array([np.cos(theta), np.sin(theta)])
+        preferred_vectors = np.stack(
+            [np.cos(self._visual_preferred_thetas), np.sin(self._visual_preferred_thetas)],
+            axis=1,
+        )
+        projections = orient_vec @ preferred_vectors.T   # (n_target,)
+        amplitudes = baseline_pA + gain_pA * projections # (n_target,)
+
+        for i_target, gen in enumerate(self._visual_generators):
+            nest.SetStatus(
+                gen,
+                {
+                    "amplitude_times": event_times,
+                    "amplitude_values": np.full(len(event_times), float(amplitudes[i_target])),
+                },
+            )

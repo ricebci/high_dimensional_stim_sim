@@ -69,6 +69,8 @@ class Network:
 
         # data directory
         self.data_path = sim_dict["data_path"]
+        self.spike_recorder_dir = os.path.join(self.data_path, "spike_recorder")
+        self.thal_recorder_dir  = os.path.join(self.data_path, "thal_recorder")
         if nest.Rank() == 0:
             if os.path.isdir(self.data_path):
                 message = "  Directory already existed."
@@ -77,6 +79,8 @@ class Network:
             else:
                 os.makedirs(self.data_path, exist_ok=True)
                 message = "  Directory has been created."
+            os.makedirs(self.spike_recorder_dir, exist_ok=True)
+            os.makedirs(self.thal_recorder_dir,  exist_ok=True)
             print("Data will be written to: {}\n{}\n".format(self.data_path, message))
 
         # derive parameters based on input dictionaries
@@ -153,31 +157,24 @@ class Network:
         input_currents : (n_neurons, ) list of nest step_current_generator's
         time_ms : stimulation time
         """
-        # connect the step current generators to neurons 1-on-1
+        # connect the step current generators to neurons 1-on-1 (only on first call)
         assert len(input_currents) == self.n_neurons
-        i_neuron = 0
-        print("Connect current input...")
-        for pop in self.pops:
-            for neuron in pop:
-                nest.Connect(input_currents[i_neuron], neuron)
-                i_neuron += 1
-        print("Connected current input")
+        if not getattr(self, "_stim_generators_connected", False):
+            i_neuron = 0
+            print("Connect current input...")
+            for pop in self.pops:
+                for neuron in pop:
+                    nest.Connect(input_currents[i_neuron], neuron)
+                    i_neuron += 1
+            print("Connected current input")
+            self._stim_generators_connected = True
 
         self.simulation_time_ms = time_ms
         nest.Simulate(time_ms)
 
-        # Remove generators so they don't accumulate across closed-loop intervals.
-        nest.Disconnect(
-            input_currents,
-            nest.NodeCollection(
-                [neuron.global_id for pop in self.pops for neuron in pop]
-            ),
-        )
-        nest.Remove(input_currents)
-
     def get_spktrains(self):
         sd_names, node_ids, data = helpers.load_spike_times(
-            self.data_path, "spike_recorder", 0, np.inf
+            self.spike_recorder_dir, "spike_recorder", 0, np.inf
         )
         last_node_id = node_ids[-1, -1]
         all_neuron_stamps = {}
@@ -233,7 +230,7 @@ class Network:
             print("Interval to plot spikes: {} ms".format(raster_plot_interval))
 
             helpers.plot_raster(
-                self.data_path,
+                self.spike_recorder_dir,
                 "spike_recorder",
                 raster_plot_interval[0],
                 raster_plot_interval[1],
@@ -243,7 +240,7 @@ class Network:
             )
 
             helpers.plot_psth(
-                self.data_path,
+                self.spike_recorder_dir,
                 "spike_recorder",
                 raster_plot_interval[0],
                 raster_plot_interval[1],
@@ -254,7 +251,7 @@ class Network:
                 "Interval to compute firing rates: {} ms".format(firing_rates_interval)
             )
             helpers.firing_rates(
-                self.data_path,
+                self.spike_recorder_dir,
                 "spike_recorder",
                 firing_rates_interval[0],
                 firing_rates_interval[1],
@@ -445,7 +442,7 @@ class Network:
 
         # write node ids to file
         if nest.Rank() == 0:
-            fn = os.path.join(self.data_path, "population_nodeids.dat")
+            fn = os.path.join(self.spike_recorder_dir, "population_nodeids.dat")
             with open(fn, "w+") as f:
                 for pop in self.pops:
                     f.write("{} {}\n".format(pop[0].global_id, pop[-1].global_id))
@@ -464,7 +461,7 @@ class Network:
                 print("  Creating spike recorders.")
             sd_dict = {
                 "record_to": "ascii",
-                "label": os.path.join(self.data_path, "spike_recorder"),
+                "label": os.path.join(self.spike_recorder_dir, "spike_recorder"),
             }
             self.spike_recorders = nest.Create(
                 "spike_recorder", n=self.num_pops, params=sd_dict
@@ -473,7 +470,7 @@ class Network:
                 "spike_recorder",
                 params={
                     "record_to": "ascii",
-                    "label": os.path.join(self.data_path, "thal_recorder"),
+                    "label": os.path.join(self.thal_recorder_dir, "thal_recorder"),
                 },
             )
 

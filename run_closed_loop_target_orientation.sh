@@ -6,7 +6,7 @@
 #
 # Outputs land in:
 #   outputs/data_system_sim_0.05scale/closed_loop_orientation0_<run>/
-#
+# So far, assumes 3858 neurons + 32 stim electrodes
 # A human-readable JSON config is written alongside the pickle at experiment end.
 
 set -euo pipefail
@@ -17,12 +17,13 @@ python closed_loop_repertoire_experiment.py \
     --model-dir                outputs/models/20260312_012405/ \
     --data-dir                 data/electrical/ \
     --vis-dir                  outputs/data_system_sim_0.05scale/visual_orientations_8/ \
-    --total-duration-ms        100 \
-    --closed-loop-interval-ms  10 \
+    --total-duration-ms        200 \
+    --closed-loop-interval-ms  70 \
     --n-repertoire-update-ms   50 \
-    --target-orientation-deg   180 \
+    --target-orientation-deg   90 \
     --random-stim-prob         0.0 \
+    --ar-aggregation           average \
     --cluster-centers-path     outputs/data_system_sim_0.05scale/visual_orientations_8/cluster_centers_analysis.json \
-    --output-name              closed_loop_orientation180_10msinterval_learning_180 \
+    --output-name              closed_loop_orientation90_70msinterval_learning_90_small_aravg_DEBUG\
     --output-prefix            closed_loop \
     --device                   mps

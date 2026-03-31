@@ -149,6 +149,16 @@ def parse_args():
             "and visual8_run_config.pkl). Required for PC-space distance metric in controller."
         ),
     )
+    parser.add_argument(
+        "--ar-aggregation",
+        type=str,
+        default="most_recent",
+        choices=["most_recent", "average"],
+        help=(
+            "How to aggregate AR predictions across forward bins when scoring patterns. "
+            "'most_recent' uses the last bin; 'average' averages all bins."
+        ),
+    )
     parser.add_argument("--fast-mode", action="store_true")
     parser.add_argument("--fast-sim-resolution-ms", type=float, default=1.0)
     parser.add_argument("--no-progress", action="store_true")
@@ -801,10 +811,11 @@ def main():
             )
         # full_neural_vector is in Hz (mean firing rate).
         hz_vector = np.array(cluster_data[key]["full_neural_vector"], dtype=np.float32)
-        # Pad to model's neuron count if the cluster-center vector is shorter
-        # (can happen when the highest-indexed neuron never spiked in the visual run).
-        if len(hz_vector) < meta["n_neurons"]:
-            hz_vector = np.pad(hz_vector, (0, meta["n_neurons"] - len(hz_vector)))
+        n_model = meta["n_neurons"]
+        if len(hz_vector) < n_model:
+            hz_vector = np.concatenate([hz_vector, np.zeros(n_model - len(hz_vector), dtype=np.float32)])
+        elif len(hz_vector) > n_model:
+            hz_vector = hz_vector[:n_model]
         target = hz_vector  # Hz, matching the PCA space
         print(
             f"Target: orientation {args.target_orientation_deg}° cluster center "
@@ -845,6 +856,7 @@ def main():
         device=args.device,
         random_stim_prob=args.random_stim_prob,
         n_relevant_output_bins=_n_relevant,
+        ar_aggregation=args.ar_aggregation,
     )
     print(f"Controller: n_relevant_output_bins={_n_relevant} "
           f"(interval={args.closed_loop_interval_ms}ms, bin={meta['bin_ms']}ms)")

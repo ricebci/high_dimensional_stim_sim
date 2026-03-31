@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import logging
 import os
 from typing import Dict, Iterable, List, Optional, Tuple
-
+from scipy.special import logsumexp
 import numpy as np
 import torch
 
@@ -103,10 +103,10 @@ class RepertoireController:
         pca_components: np.ndarray,
         pca_mean: np.ndarray,
         max_len: int = 100_000,
-        batch_size: int = 256,
         device: str = "cpu",
         random_stim_prob: float = 0.0,
         n_relevant_output_bins: Optional[int] = None,
+        ar_aggregation: str = "most_recent",
         **kwargs,   # absorb deprecated kwargs (e.g. n_repertoire_update_ms)
     ):
         self.model = model
@@ -114,7 +114,6 @@ class RepertoireController:
         self.device = device
         self.target = np.asarray(target, dtype=np.float32)
         self.max_len = max_len
-        self.batch_size = batch_size
 
         # PCA projection into 2D orientation-tuning space for distance metric.
         # Components shape: (n_components, n_neurons); mean shape: (n_neurons,).
@@ -154,6 +153,11 @@ class RepertoireController:
         self._last_selected_input: Optional[np.ndarray] = None
         # Set to True when the last returned pattern was randomly explored.
         self._last_was_random: bool = False
+
+        if ar_aggregation not in ("most_recent", "average"):
+            raise ValueError(f"ar_aggregation must be 'most_recent' or 'average', got {ar_aggregation!r}")
+        self.ar_aggregation: str = ar_aggregation
+
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -198,37 +202,55 @@ class RepertoireController:
     def _ar_forward(self, inputs: np.ndarray) -> np.ndarray:
         """Autoregressively run the model for n_relevant_output_bins steps.
 
-        At step k, fills history channel at time (ctx+1+k) with the expected
-        spike count from the model's prediction at bin k, then proceeds to k+1.
+        At each step k:
+          - The predicted spike count at bin k is written into the neural history
+            channel at position ctx+1+k for the next step.
 
-        inputs : (N, C, T) — modified in-place; history slots are filled
-                 progressively so the returned prediction is fully AR-consistent.
-        Returns : (N, n_neurons) — prediction at bin (n_relevant_output_bins - 1).
+        inputs    : (N, C, T) — modified in-place
+        Returns   : (N, n_steps, n_neurons) — predictions at every AR step.
         """
         N         = len(inputs)
         n_steps   = self.n_relevant_output_bins or self.n_input_bins
         ctx       = self.total_conv_reduction
         n_stim_ch = self.n_stim_channels
 
-        final_pred = np.empty((N, self.n_neurons), dtype=np.float32)
-
+        all_preds = np.empty((N, n_steps, self.n_neurons), dtype=np.float32)
         with torch.no_grad():
+            start = 0
+            end = N
             for k in range(n_steps):
-                is_last = (k == n_steps - 1)
-                for start in range(0, N, self.batch_size):
-                    end = min(start + self.batch_size, N)
-                    y   = self.model(
-                        torch.from_numpy(inputs[start:end]).to(self.device)
-                    ).cpu().numpy()  # (B, n_neurons, n_out)
-                    if is_last:
-                        final_pred[start:end] = y[:, :, k]
-                    elif self.history > 0:
-                        # fill lag-1 history for the next step
-                        inputs[start:end, n_stim_ch:, ctx + 1 + k] = np.exp(
-                            np.clip(y[:, :, k], -10.0, 10.0)
-                        )
+                y   = self.model(
+                    torch.from_numpy(inputs[start:end]).to(self.device)
+                ).cpu().numpy()  # (B, n_neurons, n_out)
+                all_preds[start:end, k] = y[:, :, k] # get the step-k prediction
+                if k < n_steps - 1 and self.history > 0:
+                    # fill lag-1 history for the next step
+                    inputs[start:end, n_stim_ch:, ctx + 1 + k] = np.exp(
+                        np.clip(y[:, :, k], -10.0, 10.0)
+                    )
+                    if N >= 2: 
+                        import IPython; IPython.embed()  # DEBUG
+                        print ("y:", y.shape, "inputs:", inputs.shape)
+        return all_preds  # (N, n_steps, n_neurons)
 
-        return final_pred  # (N, n_neurons)
+    def _process_ar_preds(self, all_preds: np.ndarray, bin_ms: float) -> np.ndarray:
+        """Aggregate AR predictions across steps into a single (N, n_neurons) vector.
+        Args:
+            all_preds: (N, n_steps, n_neurons) — log counts/bin
+            bin_ms: duration of one bin in milliseconds
+         Returns:
+            (N, n_neurons) — firing rates in Hz
+         """
+        # encoder model output: log counts/bin
+        # need to exponentiate to get counts/bin, multiply by 1000/bin_ms to get Hz, then do PCA projection and distance calculation in Hz space.
+
+        if self.ar_aggregation == "most_recent": 
+            return np.exp(all_preds[:, -1, :])  / bin_ms * 1000.0  # use the most recent step's prediction
+        else:  # "average"
+            # 1. Log-sum-exp across the time axis (axis 1)
+            # 2. Subtract log(N) to get the log of the mean counts
+            log_mean_counts = logsumexp(all_preds, axis=1) - np.log(all_preds.shape[1]) # for stability
+            return np.exp(log_mean_counts) / bin_ms * 1000.0  # convert to Hz
 
     def _update_stim_buf_col(self, delivered: Optional[Dict]) -> np.ndarray:
         """Summarise the just-delivered stim into a (n_stim_channels,) column."""
@@ -361,7 +383,7 @@ class RepertoireController:
             if pattern is not None:
                 stim_bins = self._stim_dict_to_bins(pattern)
                 inp = self._build_model_input(stim_bins)[None].copy()  # (1, C, T)
-                self._ar_forward(inp)          # fills history slots in-place
+                self._process_ar_preds(self._ar_forward(inp))  # fills history slots in-place
                 self._last_selected_input = inp[0]
                 self._last_was_random = True
                 if len(self._entries) < self.max_len:
@@ -372,8 +394,7 @@ class RepertoireController:
         null_input = self._build_model_input(
             np.zeros((self.n_stim_channels, self.n_input_bins), dtype=np.float32)
         )[None].copy()                                         # (1, C, T)
-        null_pred    = self._ar_forward(null_input)[0]                        # (n_neurons,) log counts/bin
-        null_pred_hz = np.exp(null_pred) / self.bin_ms * 1000.0             # → Hz
+        null_pred    = self._process_ar_preds(self._ar_forward(null_input))[0]  # (n_neurons,) log counts/bin
         null_pc      = (null_pred_hz - self.pca_mean) @ self.pca_components.T
         no_stim_dist = float(np.linalg.norm(null_pc - self._target_pc))
 
@@ -381,8 +402,7 @@ class RepertoireController:
         inputs = np.stack(
             [self._build_model_input(self._stim_dict_to_bins(p)) for p in self._entries]
         )  # (N, C, T)
-        final_preds    = self._ar_forward(inputs)                           # (N, n_neurons) log counts/bin
-        final_preds_hz = np.exp(final_preds) / self.bin_ms * 1000.0        # → Hz
+        final_preds    = self._process_ar_preds(np.exp(self._ar_forward(inputs)))  # (N, n_neurons) log counts/bin
 
         # Score in 2D PC space
         preds_pc = (final_preds_hz - self.pca_mean[None, :]) @ self.pca_components.T  # (N, K)

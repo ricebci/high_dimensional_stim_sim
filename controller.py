@@ -457,3 +457,51 @@ class RepertoireController:
         self.stim_buf[:, -1] = stim_col
 
         return self.get_stim_pattern()
+
+
+class NoEncoderController:
+    """A dummy controller that iteratively stimulates each pattern in the repertoire without using the encoding model at all.
+    Useful for ablation and debugging.
+
+    Repertoire: one single-pulse pattern per electrode (pulse at time 0 ms,
+    i.e. the first bin) for each of ``n_stim_channels`` electrodes, plus one
+    no-stimulation slot (None), for a total of ``n_stim_channels + 1`` entries.
+    Patterns are delivered in round-robin order.
+    """
+
+    def __init__(
+        self,
+        n_stim_channels: int = 32,
+        stim_amplitude_uA: float = 2.0,
+    ):
+        self.n_stim_channels = n_stim_channels
+        self.stim_amplitude_uA = stim_amplitude_uA
+
+        # Build repertoire: one single-pulse per electrode + None for no-stim
+        self._repertoire: List[Optional[Dict]] = [
+            {
+                "channels":      [ch],
+                "times_ms":      [0.0],
+                "amplitudes_uA": [float(stim_amplitude_uA)],
+            }
+            for ch in range(n_stim_channels)
+        ] + [None]  # no-stimulation slot
+
+        self._index: int = 0
+
+    def __call__(
+        self,
+        *,
+        interval_index: int,
+        interval_start_ms: float,
+        interval_end_ms: float,
+        interval_duration_ms: float,
+        new_spikes_by_neuron,
+        history,
+        delivered_pattern: Optional[Dict] = None,
+        **kwargs,
+    ) -> Optional[Dict]:
+        pattern = self._repertoire[self._index % len(self._repertoire)]
+        self._index += 1
+        return pattern
+    

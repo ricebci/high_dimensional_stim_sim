@@ -13,17 +13,24 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-python closed_loop_repertoire_experiment.py \
-    --model-dir                outputs/models/20260312_012405/ \
-    --data-dir                 data/electrical/ \
-    --vis-dir                  outputs/data_system_sim_0.05scale/visual_orientations_8/ \
-    --total-duration-ms        200 \
-    --closed-loop-interval-ms  70 \
-    --n-repertoire-update-ms   50 \
-    --target-orientation-deg   90 \
-    --random-stim-prob         0.0 \
-    --ar-aggregation           average \
-    --cluster-centers-path     outputs/data_system_sim_0.05scale/visual_orientations_8/cluster_centers_analysis.json \
-    --output-name              closed_loop_orientation90_70msinterval_learning_90_small_aravg_DEBUG\
-    --output-prefix            closed_loop \
-    --device                   mps
+# python closed_loop_repertoire_experiment.py \
+#     --model-dir                outputs/models/20260312_012405/ \
+#     --data-dir                 data/electrical/ \
+#     --vis-dir                  outputs/data_system_sim_0.05scale/visual_orientations_8/ \
+#     --total-duration-ms        200 \
+#     --closed-loop-interval-ms  70 \
+#     --n-repertoire-update-ms   50 \
+#     --target-orientation-deg   90 \
+#     --random-stim-prob         0.0 \
+#     --ar-aggregation           average \
+#     --cluster-centers-path     outputs/data_system_sim_0.05scale/visual_orientations_8/cluster_centers_analysis.json \
+#     --output-name              closed_loop_orientation90_70msinterval_learning_90_small_aravg_DEBUG\
+#     --output-prefix            closed_loop \
+#     --device                   mps
+
+python closed_loop_no_encoder_experiment.py \
+    --closed-loop-interval-ms  500 \
+    --output-name              closed_loop_no_encoder_500msinterval_DEBUG\
+    --output-prefix            closed_loop_no_encoder \
+    --n-trials                   10 \
+

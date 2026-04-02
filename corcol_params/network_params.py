@@ -146,6 +146,7 @@ net_dict = {
             ],
         },
         # standard deviation of the average membrane potential (in mV)
+        # TODO: change this for 0 baseline
         "V0_std": {
             "original": 10.0,
             "optimized": [5.36, 4.57, 4.74, 4.94, 4.94, 4.55, 5.46, 4.48],

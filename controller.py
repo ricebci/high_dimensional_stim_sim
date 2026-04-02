@@ -463,27 +463,45 @@ class NoEncoderController:
     """A dummy controller that iteratively stimulates each pattern in the repertoire without using the encoding model at all.
     Useful for ablation and debugging.
 
-    Repertoire: one single-pulse pattern per electrode (pulse at time 0 ms,
-    i.e. the first bin) for each of ``n_stim_channels`` electrodes, plus one
-    no-stimulation slot (None), for a total of ``n_stim_channels + 1`` entries.
-    Patterns are delivered in round-robin order.
+    Repertoire: one single-pulse pattern per (electrode, amplitude) combination
+    (pulse at time 0 ms) plus one no-stimulation slot, for a total of
+    ``n_stim_channels × n_amplitudes + 1`` entries delivered in round-robin order.
+    Amplitude-major ordering: all electrodes for the first amplitude, then all
+    electrodes for the second amplitude, etc.
     """
 
     def __init__(
         self,
         n_stim_channels: int = 32,
+        stim_amplitudes_uA=None,
         stim_amplitude_uA: float = 2.0,
     ):
-        self.n_stim_channels = n_stim_channels
-        self.stim_amplitude_uA = stim_amplitude_uA
+        """
+        Parameters
+        ----------
+        n_stim_channels : int
+        stim_amplitudes_uA : float | list[float] | None
+            One or more amplitudes to sweep.  When None, falls back to the
+            scalar ``stim_amplitude_uA`` for backward compatibility.
+        stim_amplitude_uA : float
+            Backward-compat scalar used only when ``stim_amplitudes_uA`` is None.
+        """
+        if stim_amplitudes_uA is None:
+            stim_amplitudes_uA = [stim_amplitude_uA]
+        elif isinstance(stim_amplitudes_uA, (int, float)):
+            stim_amplitudes_uA = [float(stim_amplitudes_uA)]
 
-        # Build repertoire: one single-pulse per electrode + None for no-stim
+        self.n_stim_channels = n_stim_channels
+        self.stim_amplitudes_uA = [float(a) for a in stim_amplitudes_uA]
+
+        # Build repertoire: all (amp, ch) combinations + no-stim slot
         self._repertoire: List[Optional[Dict]] = [
             {
                 "channels":      [ch],
                 "times_ms":      [0.0],
-                "amplitudes_uA": [float(stim_amplitude_uA)],
+                "amplitudes_uA": [amp],
             }
+            for amp in self.stim_amplitudes_uA
             for ch in range(n_stim_channels)
         ] + [None]  # no-stimulation slot
 

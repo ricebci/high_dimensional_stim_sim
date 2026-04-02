@@ -78,10 +78,16 @@ def parse_args():
         help="Number of stimulation electrodes (one repertoire entry per electrode)",
     )
     parser.add_argument(
-        "--stim-amplitude-uA",
+        "--stim-amplitudes-uA",
         type=float,
-        default=2.0,
-        help="Stimulation amplitude in µA for each single-electrode pulse",
+        nargs="+",
+        default=[2.0],
+        help=(
+            "One or more stimulation amplitudes in µA.  Each amplitude is "
+            "paired with every electrode, expanding the repertoire to "
+            "n_stim_channels × n_amplitudes + 1 entries per trial.  "
+            "Example: --stim-amplitudes-uA 1 2 3 4 5 6"
+        ),
     )
     parser.add_argument(
         "--visual-metadata-path",
@@ -115,14 +121,15 @@ def main():
     # --- Build controller ---
     controller = NoEncoderController(
         n_stim_channels=args.n_stim_channels,
-        stim_amplitude_uA=args.stim_amplitude_uA,
+        stim_amplitudes_uA=args.stim_amplitudes_uA,
     )
-    n_repertoire = len(controller._repertoire)   # n_stim_channels + 1
+    n_repertoire = len(controller._repertoire)   # n_stim_channels * n_amplitudes + 1
     total_duration_ms = args.n_trials * n_repertoire * args.closed_loop_interval_ms
 
     print(
         f"NoEncoderController: {n_repertoire} repertoire entries "
-        f"({args.n_stim_channels} single-electrode + 1 no-stim)"
+        f"({args.n_stim_channels} electrodes × {len(args.stim_amplitudes_uA)} amplitudes "
+        f"{args.stim_amplitudes_uA} µA + 1 no-stim)"
     )
     print(
         f"Trials: {args.n_trials}  |  "
@@ -150,7 +157,7 @@ def main():
         "n_stim_channels": args.n_stim_channels,
         "n_repertoire": n_repertoire,
         "n_trials": args.n_trials,
-        "stim_amplitude_uA": args.stim_amplitude_uA,
+        "stim_amplitudes_uA": args.stim_amplitudes_uA,
         "visual_metadata_path": args.visual_metadata_path,
         "data_path": sim.sim_dict["data_path"],
     }

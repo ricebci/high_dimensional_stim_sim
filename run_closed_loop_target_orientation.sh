@@ -30,7 +30,8 @@ cd "$(dirname "$0")"
 
 python closed_loop_no_encoder_experiment.py \
     --closed-loop-interval-ms  500 \
-    --output-name              closed_loop_no_encoder_500msinterval_DEBUG\
-    --output-prefix            closed_loop_no_encoder \
-    --n-trials                   10 \
+    --stim-amplitudes-uA       1 2 3 4 5 6 \
+    --n-trials                 5 \
+    --output-name              closed_loop_no_encoder_500msinterval_multiamp \
+    --output-prefix            closed_loop_no_encoder
 

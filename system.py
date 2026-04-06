@@ -42,15 +42,26 @@ from electrodes_stim import StimElectrodes
 from network_cortcol import Network
 
 # ====================PROBE=====================================================
-# Layout: 1x32 spans 1800um
+# Layout: 1xN_STIM_CHANNELS spans 1800um
 volume_v_min = 200  # um
-ch_vcoords = np.arange(32)[::-1] * 60  # index 0 -> 31 is deep -> shallow
-ch_hcoords = np.zeros(32)  # um
+volume_v_max = 1800  # um
+volume_h_min = -400  # um
+volume_h_max = 400   # um
+N_STIM_CHANNELS = 128
+# Find the closest-to-square factorization of N_STIM_CHANNELS
+_n_h = int(np.sqrt(N_STIM_CHANNELS))
+while N_STIM_CHANNELS % _n_h != 0:
+    _n_h -= 1
+_n_v = N_STIM_CHANNELS // _n_h  # 8 x 16 for 128
+_h_vals = np.linspace(volume_h_min, volume_h_max, _n_h)
+_v_vals = np.linspace(volume_v_min, volume_v_max, _n_v)
+_hh, _vv = np.meshgrid(_h_vals, _v_vals)
+ch_hcoords = _hh.ravel()
+ch_vcoords = _vv.ravel()
 ch_coordinates = np.stack([ch_hcoords, ch_vcoords], axis=1)
 
 sigma_e_um = 2.76e-7
 conductivity_constant = 10
-N_STIM_CHANNELS = len(ch_coordinates)
 
 
 def amp_decay_func(amp_uA, dist_um):
@@ -144,6 +155,8 @@ class SystemNESTSim:
             self.sim_dict["sim_resolution"] = fast_resolution
 
         nest.ResetKernel()
+        if os.environ.get("PYNEST_QUIET"):
+            nest.set_verbosity("M_ERROR")
 
         nscale = self.net_dict["N_scaling"]
         base_path = os.path.join(

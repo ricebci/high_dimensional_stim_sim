@@ -29,9 +29,14 @@ cd "$(dirname "$0")"
 #     --device                   mps
 
 python closed_loop_no_encoder_experiment.py \
-    --closed-loop-interval-ms  500 \
-    --stim-amplitudes-uA       1 2 3 4 5 6 \
-    --n-trials                 5 \
-    --output-name              closed_loop_no_encoder_500msinterval_multiamp \
-    --output-prefix            closed_loop_no_encoder
+    --closed-loop-interval-ms  1000 \
+    --same-seed                42 \
+    --stim-amplitudes-uA       1 2 3 4 5 6\
+    --n-trials                 4 \
+    --n-stim-channels          32 \
+    --n-sessions               8 \
+    --n-workers                8 \
+    --output-name              32_stimchannel_1sinterval_no_encoder_run1\
+    --output-prefix            run1\
+    --quiet
 

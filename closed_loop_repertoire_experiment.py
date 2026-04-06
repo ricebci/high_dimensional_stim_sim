@@ -472,6 +472,7 @@ def run_closed_loop_electrical_stim(
     n_repertoire_update_ms: float = 10_000.0,
     finetune_intervals: int = FINETUNE_INTERVALS,
     checkpoint_every_n_intervals: int = 10,
+    shared_interval_counter=None,
 ) -> Dict[str, str]:
     # Validate duration parameters
     if total_duration_ms <= 0:
@@ -657,6 +658,11 @@ def run_closed_loop_electrical_stim(
             }
         )
 
+        # Increment shared counter for cross-session progress tracking
+        if shared_interval_counter is not None:
+            with shared_interval_counter.get_lock():
+                shared_interval_counter.value += 1
+
         # Periodic checkpoint — flush accumulated data to disk so a cancelled
         # run leaves usable partial output at the last checkpoint boundary.
         if checkpoint_every_n_intervals > 0 and (interval_index + 1) % checkpoint_every_n_intervals == 0:
@@ -671,7 +677,11 @@ def run_closed_loop_electrical_stim(
                 bins_per_interval=bins_per_interval,
                 interval_index=interval_index,
             )
-            print(f"  [checkpoint] saved at interval {interval_index + 1}", flush=True)
+            print(
+                f"  [checkpoint] saved at interval {interval_index + 1}/{n_intervals}"
+                f" ({100 * (interval_index + 1) / n_intervals:.1f}%)",
+                flush=True,
+            )
 
         if realtime_progress:
             # --- Delivered stim summary ---
@@ -744,6 +754,7 @@ def run_closed_loop_electrical_stim(
           f"shape={spike_bins_arr.shape}  bin_ms={bin_ms}")
     print(f"Saved closed-loop spike dat    -> {dat_path}  "
           f"({len(all_spike_rows)} spikes)")
+    print(f"Simulation COMPLETE: {len(history)}/{n_intervals} intervals", flush=True)
 
     return {
         "spike_rates_path": rates_path,

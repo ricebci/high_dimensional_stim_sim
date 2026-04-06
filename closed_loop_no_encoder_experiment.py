@@ -47,19 +47,30 @@ Example (fast smoke test)
         --output-name test_no_encoder_run
 """
 import os
+import sys
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+# Parse --quiet early (before any NEST import) to suppress startup banner.
+if "--quiet" in sys.argv:
+    os.environ["PYNEST_QUIET"] = "1"
 
 import argparse
 import json
+import multiprocessing
 import pickle
 from typing import Optional
-from multiprocessing import Pool
+import threading
+import time
+from multiprocessing import Pool, Value
+
+# Use 'spawn' so each child gets a fresh NEST kernel (fork inherits
+# the parent's initialized C++ kernel state, causing hangs).
+try:
+    multiprocessing.set_start_method("spawn")
+except RuntimeError:
+    pass  # already set
 
 import numpy as np
-
-from closed_loop_repertoire_experiment import run_closed_loop_electrical_stim
-from controller import NoEncoderController
-from system import SystemNESTSim
 
 
 # ---------------------------------------------------------------------------
@@ -125,9 +136,34 @@ def parse_args():
             "When > 1, results are saved to session-specific directories."
         ),
     )
+    parser.add_argument(
+        "--n-workers",
+        type=int,
+        default=4,
+        help=(
+            "Max number of parallel workers (default 4). "
+            "Keeps NEST init from overwhelming the system. "
+            "Sessions are processed in batches of this size."
+        ),
+    )
+    parser.add_argument(
+        "--same-seed",
+        type=int,
+        default=None,
+        help=(
+            "If set, all sessions use this exact NEST random seed "
+            "(instead of a unique seed per session). Useful for "
+            "reproducing identical network initial conditions."
+        ),
+    )
     parser.add_argument("--fast-mode", action="store_true")
     parser.add_argument("--fast-sim-resolution-ms", type=float, default=1.0)
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress NEST kernel output (set verbosity to M_ERROR).",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +185,9 @@ def run_single_session(
     fast_sim_resolution_ms: float,
     no_progress: bool,
     nest_seed: Optional[int] = None,
+    quiet: bool = False,
+    shared_interval_counter=None,
+    shared_init_counter=None,
 ) -> dict:
     """
     Run a single session of the closed-loop no-encoder experiment.
@@ -165,6 +204,18 @@ def run_single_session(
     dict
         Contains keys: 'session_id', 'data_path', 'config', 'results'
     """
+    # Import heavy modules here (not at top level) so that with spawn
+    # multiprocessing, each child gets a fresh NEST kernel.
+    # Redirect stdout in worker to suppress all print output from NEST,
+    # network_cortcol, system, etc.
+    if quiet:
+        os.environ["PYNEST_QUIET"] = "1"
+        import sys as _sys
+        _sys.stdout = open(os.devnull, "w")
+    from closed_loop_repertoire_experiment import run_closed_loop_electrical_stim
+    from controller import NoEncoderController
+    from system import SystemNESTSim
+
     # Append session suffix to output names if running multiple sessions
     session_output_name = output_name if nest_seed is None else f"{output_name}_session_{session_id:03d}"
     session_output_prefix = output_prefix if nest_seed is None else f"{output_prefix}_session_{session_id:03d}"
@@ -199,7 +250,7 @@ def run_single_session(
     # Set NEST random seed if provided
     if nest_seed is not None:
         import nest
-        nest.SetKernelStatus({"rng_seeds": [nest_seed]})
+        nest.SetKernelStatus({"rng_seed": nest_seed})
 
     # Recreate visual current generators if metadata path is provided
     if visual_metadata_path is not None and os.path.isfile(visual_metadata_path):
@@ -208,6 +259,7 @@ def run_single_session(
         sim.setup_visual_generators_from_metadata(visual_metadata_path)
 
     # Write partial config in case the run is interrupted
+    from system import volume_v_min, volume_v_max, volume_h_min, volume_h_max
     partial_config = {
         "session_id": session_id,
         "nest_seed": nest_seed,
@@ -220,12 +272,24 @@ def run_single_session(
         "stim_amplitudes_uA": stim_amplitudes_uA,
         "visual_metadata_path": visual_metadata_path,
         "data_path": sim.sim_dict["data_path"],
+        "completed": False,
+        "electrode_volume_bounds_um": {
+            "v_min": volume_v_min,
+            "v_max": volume_v_max,
+            "h_min": volume_h_min,
+            "h_max": volume_h_max,
+        },
     }
     partial_config_path = os.path.join(
         sim.sim_dict["data_path"], f"{session_output_prefix}_config.json"
     )
     with open(partial_config_path, "w") as f:
         json.dump(partial_config, f, indent=2)
+
+    # Signal that NEST init is done, simulation loop is starting
+    if shared_init_counter is not None:
+        with shared_init_counter.get_lock():
+            shared_init_counter.value += 1
 
     # Run the closed-loop experiment
     results = run_closed_loop_electrical_stim(
@@ -239,10 +303,11 @@ def run_single_session(
         bin_ms=bin_ms,
         n_repertoire_update_ms=total_duration_ms + 1.0,
         finetune_intervals=0,
+        shared_interval_counter=shared_interval_counter,
     )
 
-    # Save full config
-    config = {**partial_config, "results": results}
+    # Save full config with completion marker
+    config = {**partial_config, "completed": True, "results": results}
     config_path = os.path.join(
         sim.sim_dict["data_path"], f"{session_output_prefix}_config.pkl"
     )
@@ -259,12 +324,34 @@ def run_single_session(
     }
 
 
+_shared_counter = None
+_shared_init_counter = None
+_shared_started_counter = None
+
+def _pool_initializer(counter, init_counter, started_counter):
+    """Store shared counters in each worker process."""
+    global _shared_counter, _shared_init_counter, _shared_started_counter
+    _shared_counter = counter
+    _shared_init_counter = init_counter
+    _shared_started_counter = started_counter
+
 def run_session_wrapper(args_tuple):
     """
     Wrapper function for multiprocessing.Pool.map.
     Unpacks arguments and calls run_single_session.
     """
-    return run_single_session(*args_tuple)
+    # Signal that this task has been picked up by a worker
+    if _shared_started_counter is not None:
+        with _shared_started_counter.get_lock():
+            _shared_started_counter.value += 1
+    # Last element is quiet flag; rest are positional args
+    *positional, quiet = args_tuple
+    return run_single_session(
+        *positional,
+        quiet=quiet,
+        shared_interval_counter=_shared_counter,
+        shared_init_counter=_shared_init_counter,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +383,8 @@ def main():
             fast_mode=args.fast_mode,
             fast_sim_resolution_ms=args.fast_sim_resolution_ms,
             no_progress=args.no_progress,
-            nest_seed=None,
+            nest_seed=args.same_seed,
+            quiet=args.quiet,
         )
         print("Closed-loop no-encoder experiment complete")
         print("Data path:", result["data_path"])
@@ -304,7 +392,27 @@ def main():
 
     # --- Multiple sessions mode (parallelized) ---
     else:
-        print(f"Running {args.n_sessions} parallel sessions...")
+        # Compute total intervals across all sessions for progress tracking
+        n_stim_channels = args.n_stim_channels
+        n_amplitudes = len(args.stim_amplitudes_uA)
+        n_repertoire = n_stim_channels * n_amplitudes + 1
+        intervals_per_session = args.n_trials * n_repertoire
+        total_intervals = args.n_sessions * intervals_per_session
+
+        n_workers = min(args.n_workers, args.n_sessions)
+        print(f"Running {args.n_sessions} sessions with {n_workers} parallel workers...")
+        print(
+            f"  {intervals_per_session} intervals/session × "
+            f"{args.n_sessions} sessions = {total_intervals} total intervals"
+        )
+
+        # Suppress per-interval progress in parallel mode (interleaved output is unreadable)
+        parallel_no_progress = True
+
+        # Shared counters for cross-process progress
+        shared_counter = Value('i', 0)         # intervals completed
+        shared_init_counter = Value('i', 0)    # sessions that finished NEST init
+        shared_started_counter = Value('i', 0) # sessions that started (task picked up)
 
         # Prepare arguments for each session
         session_args = [
@@ -320,18 +428,74 @@ def main():
                 args.output_prefix,
                 args.fast_mode,
                 args.fast_sim_resolution_ms,
-                args.no_progress,
-                10000 + session_id,  # Unique nest seed for each session
+                parallel_no_progress,
+                args.same_seed if args.same_seed is not None else 10000 + session_id,
+                args.quiet,
             )
             for session_id in range(args.n_sessions)
         ]
 
+        # tqdm progress bar updated from shared counter
+        from tqdm import tqdm
+
+        t0 = time.time()
+        _monitor_stop = threading.Event()
+
+        pbar = tqdm(
+            total=total_intervals,
+            desc="Intervals",
+            unit="it",
+            bar_format=(
+                "{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                "[{elapsed}<{remaining}, {rate_fmt}]"
+            ),
+        )
+        _last_pbar_n = 0
+
+        def _progress_monitor():
+            nonlocal _last_pbar_n
+            while not _monitor_stop.wait(2):
+                done = shared_counter.value
+                if done > _last_pbar_n:
+                    pbar.update(done - _last_pbar_n)
+                    _last_pbar_n = done
+                elif done == 0:
+                    started = shared_started_counter.value
+                    inited = shared_init_counter.value
+                    pbar.set_postfix_str(
+                        f"init {inited}/{args.n_sessions}  "
+                        f"started {started}/{args.n_sessions}"
+                    )
+
+        monitor = threading.Thread(target=_progress_monitor, daemon=True)
+        monitor.start()
+
         # Run sessions in parallel
-        with Pool(processes=None) as pool:  # None = use all available CPUs
-            results = pool.map(run_session_wrapper, session_args)
+        results = []
+        with Pool(
+            processes=n_workers,
+            initializer=_pool_initializer,
+            initargs=(shared_counter, shared_init_counter, shared_started_counter),
+        ) as pool:
+            for result in pool.imap_unordered(run_session_wrapper, session_args):
+                results.append(result)
+                pbar.set_postfix_str(
+                    f"sessions {len(results)}/{args.n_sessions}"
+                )
+
+        # Final update
+        done = shared_counter.value
+        if done > _last_pbar_n:
+            pbar.update(done - _last_pbar_n)
+        pbar.close()
+        _monitor_stop.set()
+        monitor.join()
+
+        results.sort(key=lambda r: r["session_id"])
 
         # Print summary
-        print(f"\nAll {args.n_sessions} sessions complete!")
+        total_time = time.time() - t0
+        print(f"\nAll {args.n_sessions} sessions complete in {total_time:.0f}s!")
         for result in results:
             print(f"  Session {result['session_id']}: {result['data_path']}")
 

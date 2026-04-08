@@ -53,12 +53,32 @@ def make_electrode_grid(n_stim_channels: int) -> np.ndarray:
     """Return (n_stim_channels, 2) array of [h, v] electrode coordinates.
 
     Electrodes are placed on an evenly-spaced rectangular grid that fills
-    the probe volume defined by ``volume_{v,h}_{min,max}``.
+    the probe volume defined by ``volume_{v,h}_{min,max}``.  If one axis
+    has zero extent (min == max), all channels are distributed along the
+    other axis only.
     """
-    n_h = int(np.sqrt(n_stim_channels))
-    while n_stim_channels % n_h != 0:
-        n_h -= 1
-    n_v = n_stim_channels // n_h
+    h_has_extent = (volume_h_max != volume_h_min)
+    v_has_extent = (volume_v_max != volume_v_min)
+
+    if h_has_extent and v_has_extent:
+        # 2-D grid: factor n_stim_channels into n_h x n_v
+        n_h = int(np.sqrt(n_stim_channels))
+        while n_stim_channels % n_h != 0:
+            n_h -= 1
+        n_v = n_stim_channels // n_h
+    elif v_has_extent:
+        # Only vertical extent: single column
+        n_h = 1
+        n_v = n_stim_channels
+    elif h_has_extent:
+        # Only horizontal extent: single row
+        n_h = n_stim_channels
+        n_v = 1
+    else:
+        # Both axes collapsed: all electrodes at the same point
+        n_h = 1
+        n_v = n_stim_channels
+
     h_vals = np.linspace(volume_h_min, volume_h_max, n_h)
     v_vals = np.linspace(volume_v_min, volume_v_max, n_v)
     hh, vv = np.meshgrid(h_vals, v_vals)

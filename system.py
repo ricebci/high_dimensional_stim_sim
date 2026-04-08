@@ -44,9 +44,9 @@ from network_cortcol import Network
 # ====================PROBE=====================================================
 volume_v_min = 200  # um
 volume_v_max = 1800  # um
-volume_h_min = -400  # um
-volume_h_max = 400   # um
-N_STIM_CHANNELS = 128  # default; actual count set via SystemNESTSim(n_stim_channels=...)
+volume_h_min = 0  # um
+volume_h_max = 0   # um
+N_STIM_CHANNELS = 32  # default; actual count set via SystemNESTSim(n_stim_channels=...)
 
 
 def make_electrode_grid(n_stim_channels: int) -> np.ndarray:

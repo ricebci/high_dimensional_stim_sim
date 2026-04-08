@@ -42,23 +42,27 @@ from electrodes_stim import StimElectrodes
 from network_cortcol import Network
 
 # ====================PROBE=====================================================
-# Layout: 1xN_STIM_CHANNELS spans 1800um
 volume_v_min = 200  # um
 volume_v_max = 1800  # um
 volume_h_min = -400  # um
 volume_h_max = 400   # um
-N_STIM_CHANNELS = 128
-# Find the closest-to-square factorization of N_STIM_CHANNELS
-_n_h = int(np.sqrt(N_STIM_CHANNELS))
-while N_STIM_CHANNELS % _n_h != 0:
-    _n_h -= 1
-_n_v = N_STIM_CHANNELS // _n_h  # 8 x 16 for 128
-_h_vals = np.linspace(volume_h_min, volume_h_max, _n_h)
-_v_vals = np.linspace(volume_v_min, volume_v_max, _n_v)
-_hh, _vv = np.meshgrid(_h_vals, _v_vals)
-ch_hcoords = _hh.ravel()
-ch_vcoords = _vv.ravel()
-ch_coordinates = np.stack([ch_hcoords, ch_vcoords], axis=1)
+N_STIM_CHANNELS = 128  # default; actual count set via SystemNESTSim(n_stim_channels=...)
+
+
+def make_electrode_grid(n_stim_channels: int) -> np.ndarray:
+    """Return (n_stim_channels, 2) array of [h, v] electrode coordinates.
+
+    Electrodes are placed on an evenly-spaced rectangular grid that fills
+    the probe volume defined by ``volume_{v,h}_{min,max}``.
+    """
+    n_h = int(np.sqrt(n_stim_channels))
+    while n_stim_channels % n_h != 0:
+        n_h -= 1
+    n_v = n_stim_channels // n_h
+    h_vals = np.linspace(volume_h_min, volume_h_max, n_h)
+    v_vals = np.linspace(volume_v_min, volume_v_max, n_v)
+    hh, vv = np.meshgrid(h_vals, v_vals)
+    return np.stack([hh.ravel(), vv.ravel()], axis=1)
 
 sigma_e_um = 2.76e-7
 conductivity_constant = 10
@@ -119,6 +123,7 @@ class SystemNESTSim:
         stim_pulse_params: Dict[str, float] = None,
         fast_mode: bool = False,
         fast_sim_resolution_ms: Optional[float] = None,
+        n_stim_channels: int = 128,
     ):
         """
         Initialize NEST and set up the network.
@@ -135,6 +140,9 @@ class SystemNESTSim:
         fast_sim_resolution_ms
             Optional override for simulation resolution when fast_mode is True.
             Defaults to 1.0 ms if not provided.
+        n_stim_channels
+            Number of stimulation electrodes. Electrode coordinates are
+            computed as an evenly-spaced grid within the probe volume.
         """
         self.window_ms = window_ms
         self.overlap_ms = overlap_ms
@@ -157,6 +165,7 @@ class SystemNESTSim:
         nest.ResetKernel()
         if os.environ.get("PYNEST_QUIET"):
             nest.set_verbosity("M_ERROR")
+            self.sim_dict["print_time"] = False
 
         nscale = self.net_dict["N_scaling"]
         base_path = os.path.join(
@@ -167,6 +176,8 @@ class SystemNESTSim:
         self.sim_dict["data_path"] = os.path.join(base_path, output_name)
         os.makedirs(self.sim_dict["data_path"], exist_ok=True)
 
+        ch_coordinates = make_electrode_grid(n_stim_channels)
+        self.n_stim_channels = n_stim_channels
         self.electrodes = StimElectrodes(
             ch_coordinates,
             self.stim_pulse_params,

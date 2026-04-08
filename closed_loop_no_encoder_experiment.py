@@ -245,6 +245,7 @@ def run_single_session(
         output_name=session_output_name,
         fast_mode=fast_mode,
         fast_sim_resolution_ms=fast_sim_resolution_ms,
+        n_stim_channels=n_stim_channels,
     )
 
     # Set NEST random seed if provided

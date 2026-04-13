@@ -34,12 +34,12 @@ def parse_args():
     parser.add_argument("data_dir", help="Path to stimulation data directory (e.g. outputs/32_stimchannel_hv_space_1sinterval)")
     parser.add_argument("--visual-dir", default="outputs/visual_orientations_8",
                         help="Path to visual orientations data (default: outputs/visual_orientations_8)")
-    parser.add_argument("--k", type=float, default=0.00043,
-                        help="NNLS weighting parameter (default: 0.00043)")
+    parser.add_argument("--k", type=float, default=0.0,
+                        help="NNLS weighting parameter (default: 0.0, unweighted)")
     parser.add_argument("--n-stim-channels", type=int, default=32,
                         help="Number of stimulation channels (default: 32)")
     parser.add_argument("--prefix", default=None,
-                        help="Session directory prefix (default: derived from n_stim_channels)")
+                        help="Session directory prefix (default: auto-detected from data_dir)")
     parser.add_argument("--window-bin-start", type=int, default=0,
                         help="STA window start bin index (default: 0)")
     parser.add_argument("--window-bin-end", type=int, default=14,
@@ -91,7 +91,14 @@ def load_spikes_robust(path, name_prefix, begin_ms, end_ms):
 
 def load_visual_responses(visual_dir, visual_epoch_ms):
     """Load visual orientation responses and compute avg_vectors."""
-    run_config_path = os.path.join(visual_dir, "visual8_run_config.pkl")
+    # Auto-detect run config: look for *_run_config.pkl or *_config.pkl
+    _pkl_candidates = [f for f in os.listdir(visual_dir) if f.endswith("_run_config.pkl")]
+    if not _pkl_candidates:
+        _pkl_candidates = [f for f in os.listdir(visual_dir) if f.endswith("_config.pkl")]
+    if not _pkl_candidates:
+        raise FileNotFoundError(f"No *_run_config.pkl or *_config.pkl found in {visual_dir}")
+    run_config_path = os.path.join(visual_dir, _pkl_candidates[0])
+    print(f"Using run config: {run_config_path}")
     with open(run_config_path, "rb") as f:
         run_config = pickle.load(f)
 
@@ -153,11 +160,22 @@ def load_visual_responses(visual_dir, visual_epoch_ms):
 
 
 # ── Electrical stim data loading ─────────────────────────────────────────
-def load_stim_sessions(data_dir, prefix, n_stim_channels):
+def detect_session_dirs(data_dir, prefix=None):
+    """Auto-detect session subdirectories. If prefix is given, filter by it;
+    otherwise find all subdirs containing '_session_'."""
+    if prefix:
+        return sorted([d for d in os.listdir(data_dir)
+                       if d.startswith(prefix)
+                       and os.path.isdir(os.path.join(data_dir, d))])
+    return sorted([d for d in os.listdir(data_dir)
+                   if "_session_" in d
+                   and os.path.isdir(os.path.join(data_dir, d))])
+
+
+def load_stim_sessions(data_dir, session_dirs, n_stim_channels):
     """Load and aggregate multi-session spike data."""
-    session_dirs = sorted([d for d in os.listdir(data_dir)
-                           if d.startswith(prefix)
-                           and os.path.isdir(os.path.join(data_dir, d))])
+    if len(session_dirs) == 0:
+        raise RuntimeError(f"No sessions found in {data_dir}")
     print(f"Loading {len(session_dirs)} sessions from {data_dir}")
 
     all_spike_bins_list = []
@@ -204,16 +222,16 @@ def load_stim_sessions(data_dir, prefix, n_stim_channels):
         all_spike_bins_list.append(session_spike_bins)
         all_histories.extend(session_history)
 
-    if len(all_spike_bins_list) == 0:
-        raise RuntimeError(f"No sessions found in {data_dir}")
-
     spike_bins_arr = np.concatenate(all_spike_bins_list, axis=0)
-    print(f"spike_bins_arr shape: {spike_bins_arr.shape}")
+    # Neuron axis from get_spike_train_list uses abs(sender - last_node_id) + 1,
+    # so index 0 = deepest. Flip to node-ID order: index 0 = shallowest.
+    spike_bins_arr = spike_bins_arr[:, :, ::-1].copy()
+    print(f"spike_bins_arr shape: {spike_bins_arr.shape} (neuron axis: node-ID order)")
     return spike_bins_arr, all_histories, bin_ms
 
 
 # ── Electrode grid ───────────────────────────────────────────────────────
-def make_electrode_grid(data_dir, session_dirs, prefix, n_stim_channels):
+def make_electrode_grid(data_dir, session_dirs, n_stim_channels):
     """Reproduce electrode grid from config bounds."""
     _first_session_path = os.path.join(data_dir, session_dirs[0])
     _first_config_path = [f for f in os.listdir(_first_session_path) if f.endswith("config.json")][0]
@@ -315,8 +333,8 @@ def compute_stas(spike_bins_arr, history, bin_ms, n_stim_channels,
 
     for ch, amp in pattern_keys:
         idx = pattern_to_indices[(ch, amp)]
-        sta_hz = spike_bins_arr[idx, WINDOW_BIN_START:WINDOW_BIN_END, neuron_slice].mean(axis=0)[:, ::-1] / float(bin_ms) * 1000.0
-        sta_spkcount[(ch, amp)] = spike_bins_arr[idx, WINDOW_BIN_START:WINDOW_BIN_END, neuron_slice].mean(axis=0)[:, ::-1].sum(axis=0)
+        sta_hz = spike_bins_arr[idx, WINDOW_BIN_START:WINDOW_BIN_END, neuron_slice].mean(axis=0) / float(bin_ms) * 1000.0
+        sta_spkcount[(ch, amp)] = spike_bins_arr[idx, WINDOW_BIN_START:WINDOW_BIN_END, neuron_slice].mean(axis=0).sum(axis=0)
 
         fig, ax = plt.subplots(figsize=(9, 5))
         _window = sta_hz[WINDOW_BIN_START:WINDOW_BIN_END, :].T
@@ -355,11 +373,14 @@ def compute_stas(spike_bins_arr, history, bin_ms, n_stim_channels,
 
 
 # ── NNLS solver ──────────────────────────────────────────────────────────
-def solve_nonneg_least_squares(A, b, k=1.0):
+def solve_nonneg_least_squares(A, b, k=0.0):
     """Solve min_x || W(Ax - b) ||_2^2  subject to x >= 0"""
     n_patterns = A.shape[1]
     x = cp.Variable(n_patterns, nonneg=True)
-    W = np.diag(b + k)
+    if k == 0:
+        W = np.eye(len(b))
+    else:
+        W = np.diag(b + k)
     objective = cp.Minimize(cp.sum_squares(W @ (A @ x - b)))
     problem = cp.Problem(objective)
     problem.solve(solver=cp.OSQP, verbose=False)
@@ -369,6 +390,68 @@ def solve_nonneg_least_squares(A, b, k=1.0):
 
     x_opt = x.value
     residual_norm = np.linalg.norm(A @ x_opt - b)
+    return x_opt, residual_norm
+
+
+def solve_mlp(A, b, k=0.0, hidden_sizes=(128, 64), lr=1e-3, n_iters=5000, seed=42):
+    """
+    Solve min_x || f(x) - b ||_2^2 subject to x >= 0, where f is a small MLP
+    trained so that f(x) ≈ A @ x near the optimum but can capture nonlinearities.
+
+    A: (n_features, n_patterns) — used to initialise the first layer
+    b: (n_features,)
+    Returns:
+        x_opt: (n_patterns,) optimal non-negative coefficients
+        residual_norm: scalar, || f(x_opt) - b ||_2
+    """
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+    n_features, n_patterns = A.shape
+
+    # Build MLP: n_patterns -> hidden -> ... -> n_features
+    layers = []
+    in_dim = n_patterns
+    for h in hidden_sizes:
+        layers.append(nn.Linear(in_dim, h))
+        layers.append(nn.ReLU())
+        in_dim = h
+    layers.append(nn.Linear(in_dim, n_features))
+    mlp = nn.Sequential(*layers)
+
+    # Initialise first layer from A so the MLP starts near the linear solution
+    with torch.no_grad():
+        proj_mat = torch.randn(hidden_sizes[0], n_features)
+        mlp[0].weight.copy_(proj_mat @ torch.tensor(A, dtype=torch.float32))
+        mlp[0].bias.zero_()
+
+    b_t = torch.tensor(b, dtype=torch.float32)
+    # Optimisable coefficients (unconstrained); softplus ensures x >= 0
+    x_raw = nn.Parameter(torch.zeros(n_patterns))
+
+    if k > 0:
+        W = torch.tensor(np.diag(b + k), dtype=torch.float32)
+    else:
+        W = torch.eye(n_features)
+
+    optimizer = torch.optim.Adam(list(mlp.parameters()) + [x_raw], lr=lr)
+
+    for i in range(n_iters):
+        optimizer.zero_grad()
+        x_pos = nn.functional.softplus(x_raw)  # non-negative
+        pred = mlp(x_pos)
+        loss = ((W @ (pred - b_t)) ** 2).sum()
+        loss.backward()
+        optimizer.step()
+        if (i + 1) % 1000 == 0:
+            print(f"  iter {i+1}/{n_iters}  loss={loss.item():.4f}")
+
+    with torch.no_grad():
+        x_opt = nn.functional.softplus(x_raw).numpy()
+        pred_final = mlp(torch.tensor(x_opt, dtype=torch.float32)).numpy()
+        residual_norm = np.linalg.norm(pred_final - b)
+
     return x_opt, residual_norm
 
 
@@ -514,7 +597,7 @@ def plot_3d_projections(avg_vectors, approx_log, orientations_deg, ori_colors, p
     ap_max = approx_proj.max(axis=0)
     ap_pad = (ap_max - ap_min) * 0.2 + 1e-6
 
-    scene_labels = dict(xaxis_title="Proj 1", yaxis_title="Proj 2", zaxis_title="Proj 3")
+    scene_labels = dict(xaxis_title="Condition-Invariant", yaxis_title="PC1", zaxis_title="PC2")
     fig.update_layout(
         title="PCA of Average Visual Response Vectors",
         scene=dict(**scene_labels),
@@ -551,20 +634,55 @@ def compute_orientation_mses(avg_vectors, approx_log, orientations_deg):
     mse_per_orientation = np.mean((avg_vectors - approx_log) ** 2, axis=1)
     for i, angle in enumerate(orientations_deg):
         print(f"  Orientation {angle}\u00b0: MSE = {mse_per_orientation[i]:.4f}")
+    print(f"  Average MSE: {mse_per_orientation.mean():.4f}")
     return mse_per_orientation
 
 
+def plot_mse_and_angles(mse_per_orientation, orientations_deg, angles, viz_dir):
+    """Two-subplot figure: per-orientation MSEs on top, principal angles on bottom."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6))
+
+    # Top: MSE per orientation
+    x_idx = np.arange(len(orientations_deg))
+    ax1.bar(x_idx, mse_per_orientation, color="steelblue")
+    ax1.axhline(mse_per_orientation.mean(), color="red", linestyle="--", linewidth=1,
+                label=f"Mean MSE = {mse_per_orientation.mean():.4f}")
+    ax1.set_xticks(x_idx)
+    ax1.set_xticklabels([f"{a}°" for a in orientations_deg], fontsize=8)
+    ax1.set_xlabel("Orientation")
+    ax1.set_ylabel("MSE")
+    ax1.set_title("Approximation MSE per Orientation")
+    ax1.legend(fontsize=8)
+
+    # Bottom: principal angles
+    angles_deg = np.degrees(angles)
+    ax2.bar(np.arange(len(angles_deg)), angles_deg, color="darkorange")
+    ax2.set_xticks(np.arange(len(angles_deg)))
+    ax2.set_xticklabels([f"{i+1}" for i in range(len(angles_deg))], fontsize=8)
+    ax2.set_xlabel("Component index")
+    ax2.set_ylabel("Angle (degrees)")
+    ax2.set_title("Principal Angles Between Orientation and Stimulation Subspaces")
+
+    plt.tight_layout()
+    out = os.path.join(viz_dir, "mse_and_principal_angles.png")
+    plt.savefig(out, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
 def save_approx_config(approx_log, stim_log, pattern_keys, mse_per_orientation,
-                       angles, orientations_deg, out_dir):
+                       angles, orientations_deg, out_dir, visual_dir=None):
     """Save approximation results as JSON."""
     approx_config = {
         "approx_vectors": approx_log.tolist(),
         "stim_coefficients": np.array(stim_log).tolist(),
         "pattern_keys": [list(k) for k in pattern_keys],
         "orientation_mses": mse_per_orientation.tolist(),
+        "mean_mse": mse_per_orientation.mean(),
         "principal_angles_rad": angles.tolist(),
         "principal_angles_deg": np.degrees(angles).tolist(),
         "orientations_deg": list(orientations_deg),
+        **({"visual_dir": visual_dir} if visual_dir is not None else {}),
     }
 
     approx_config_path = os.path.join(out_dir, "approx_config.json")
@@ -583,7 +701,7 @@ def main():
     visual_dir = args.visual_dir
     k = args.k
     n_stim_channels = args.n_stim_channels
-    prefix = args.prefix or f"{n_stim_channels}_stimchannel_1sinterval"
+    prefix = args.prefix
     window_bin_start = args.window_bin_start
     window_bin_end = args.window_bin_end
     visual_epoch_ms = args.visual_epoch_ms
@@ -591,8 +709,9 @@ def main():
     assert os.path.exists(data_dir), f"Data directory not found: {data_dir}"
     assert os.path.exists(visual_dir), f"Visual directory not found: {visual_dir}"
 
-    # Output directory encodes key parameters
-    run_label = f"k{k}_wbin{window_bin_start}-{window_bin_end}"
+    # Output directory encodes key parameters + visual dataset
+    visual_label = os.path.basename(os.path.normpath(visual_dir))
+    run_label = f"k{k}_wbin{window_bin_start}-{window_bin_end}_vis-{visual_label}"
     viz_dir = os.path.join(data_dir, "viz", run_label)
     os.makedirs(viz_dir, exist_ok=True)
     print(f"Output directory: {viz_dir}")
@@ -605,10 +724,9 @@ def main():
 
     # 2. Load stim sessions
     print("\n=== Loading stimulation sessions ===")
-    session_dirs = sorted([d for d in os.listdir(data_dir)
-                           if d.startswith(prefix)
-                           and os.path.isdir(os.path.join(data_dir, d))])
-    spike_bins_arr, history, bin_ms = load_stim_sessions(data_dir, prefix, n_stim_channels)
+    session_dirs = detect_session_dirs(data_dir, prefix)
+    assert len(session_dirs) > 0, f"No session directories found in {data_dir}"
+    spike_bins_arr, history, bin_ms = load_stim_sessions(data_dir, session_dirs, n_stim_channels)
 
     # Validate window bins against epoch and bin resolution
     window_ms = bin_ms * window_bin_end
@@ -619,7 +737,7 @@ def main():
 
     # 3. Electrode and neuron locations
     print("\n=== Setting up electrode and neuron locations ===")
-    electrode_h, electrode_v = make_electrode_grid(data_dir, session_dirs, prefix, n_stim_channels)
+    electrode_h, electrode_v = make_electrode_grid(data_dir, session_dirs, n_stim_channels)
     neuron_h_all, neuron_v_all = make_neuron_locations()
 
     # 4. Compute STAs
@@ -652,10 +770,13 @@ def main():
     print("\n=== Orientation MSEs ===")
     mse_per_orientation = compute_orientation_mses(avg_vectors, approx_log, orientations_deg)
 
-    # 10. Save config
+    # 10. MSE & principal angles plot
+    plot_mse_and_angles(mse_per_orientation, orientations_deg, angles, viz_dir)
+
+    # 11. Save config
     print("\n=== Saving results ===")
     save_approx_config(approx_log, stim_log, pattern_keys, mse_per_orientation,
-                       angles, orientations_deg, viz_dir)
+                       angles, orientations_deg, viz_dir, visual_dir=visual_dir)
 
     print("\nDone.")
 

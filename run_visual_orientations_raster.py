@@ -17,6 +17,16 @@ Example with custom arguments:
         --sparsity 0.05 \
         --output-name visual_custom \
         --output-prefix custom
+
+
+    python run_visual_orientations_raster.py \
+       --gain-pA 320.0 \
+        --n-repeats 50 \
+        --on-duration-ms 500 \
+        --off-duration-ms 500 \
+        --sparsity 0.05 \
+        --output-name visual_custom_stronger2 \
+        --output-prefix custom
 tu
 What this script does
 ---------------------

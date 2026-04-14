@@ -118,13 +118,26 @@ def parse_args():
     parser.add_argument(
         "--visual-metadata-path",
         type=str,
-        default="outputs/data_system_sim_0.05scale/visual_orientations_8/visual8_stim_metadata.pkl",
+        default=None,
         help=(
             "Path to visual8_stim_metadata.pkl. When provided, per-neuron visual "
-            "current generators are recreated in the NEST kernel."
+            "current generators are recreated in the NEST kernel. "
+            "Default: auto-derived from --n-scaling."
         ),
     )
     parser.add_argument("--output-name", type=str, default="closed_loop_no_encoder")
+    parser.add_argument(
+        "--n-scaling",
+        type=float,
+        default=None,
+        help="Override N_scaling (neuron count factor). Default: use network_params.py value.",
+    )
+    parser.add_argument(
+        "--k-scaling",
+        type=float,
+        default=None,
+        help="Override K_scaling (indegree factor). Default: use network_params.py value.",
+    )
     parser.add_argument("--output-prefix", type=str, default="no_encoder")
     parser.add_argument(
         "--n-sessions",
@@ -188,6 +201,8 @@ def run_single_session(
     quiet: bool = False,
     shared_interval_counter=None,
     shared_init_counter=None,
+    n_scaling: Optional[float] = None,
+    k_scaling: Optional[float] = None,
 ) -> dict:
     """
     Run a single session of the closed-loop no-encoder experiment.
@@ -240,18 +255,17 @@ def run_single_session(
             f"Total duration: {total_duration_ms:.0f} ms"
         )
 
-    # Initialize NEST network
+    # Initialize NEST network with seed passed through to control both
+    # NEST RNG and neuron placement consistently.
     sim = SystemNESTSim(
         output_name=session_output_name,
         fast_mode=fast_mode,
         fast_sim_resolution_ms=fast_sim_resolution_ms,
         n_stim_channels=n_stim_channels,
+        n_scaling=n_scaling,
+        k_scaling=k_scaling,
+        rng_seed=nest_seed,
     )
-
-    # Set NEST random seed if provided
-    if nest_seed is not None:
-        import nest
-        nest.SetKernelStatus({"rng_seed": nest_seed})
 
     # Recreate visual current generators if metadata path is provided
     if visual_metadata_path is not None and os.path.isfile(visual_metadata_path):
@@ -345,13 +359,15 @@ def run_session_wrapper(args_tuple):
     if _shared_started_counter is not None:
         with _shared_started_counter.get_lock():
             _shared_started_counter.value += 1
-    # Last element is quiet flag; rest are positional args
-    *positional, quiet = args_tuple
+    # Last three elements are quiet, n_scaling, k_scaling; rest are positional args
+    *positional, quiet, n_scaling, k_scaling = args_tuple
     return run_single_session(
         *positional,
         quiet=quiet,
         shared_interval_counter=_shared_counter,
         shared_init_counter=_shared_init_counter,
+        n_scaling=n_scaling,
+        k_scaling=k_scaling,
     )
 
 
@@ -368,6 +384,15 @@ def main():
         raise ValueError("--closed-loop-interval-ms must be > 0")
     if args.n_sessions <= 0:
         raise ValueError("--n-sessions must be > 0")
+
+    # Resolve visual metadata path from scaling if not explicitly provided
+    if args.visual_metadata_path is None:
+        from corcol_params.network_params import net_dict as _nd
+        _nscale = args.n_scaling if args.n_scaling is not None else _nd["N_scaling"]
+        args.visual_metadata_path = (
+            f"outputs/data_system_sim_{_nscale}scale/"
+            f"visual_orientations_8/visual8_stim_metadata.pkl"
+        )
 
     # --- Single session mode ---
     if args.n_sessions == 1:
@@ -386,6 +411,8 @@ def main():
             no_progress=args.no_progress,
             nest_seed=args.same_seed,
             quiet=args.quiet,
+            n_scaling=args.n_scaling,
+            k_scaling=args.k_scaling,
         )
         print("Closed-loop no-encoder experiment complete")
         print("Data path:", result["data_path"])
@@ -432,6 +459,8 @@ def main():
                 parallel_no_progress,
                 args.same_seed if args.same_seed is not None else 10000 + session_id,
                 args.quiet,
+                args.n_scaling,
+                args.k_scaling,
             )
             for session_id in range(args.n_sessions)
         ]

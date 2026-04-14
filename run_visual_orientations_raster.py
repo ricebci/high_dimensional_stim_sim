@@ -197,8 +197,8 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=7,
-        help="Random seed (default: 7)",
+        default=None,
+        help="Random seed for visual neuron selection (default: use system RNG seed)",
     )
     parser.add_argument(
         "--fast-mode",
@@ -221,6 +221,18 @@ def parse_args():
         type=float,
         default=10.0,
         help="Progress chunk size in ms when realtime progress is enabled (default: 10.0)",
+    )
+    parser.add_argument(
+        "--n-scaling",
+        type=float,
+        default=None,
+        help="Override N_scaling (neuron count factor). Default: use network_params.py value.",
+    )
+    parser.add_argument(
+        "--k-scaling",
+        type=float,
+        default=None,
+        help="Override K_scaling (indegree factor). Default: use network_params.py value.",
     )
     return parser.parse_args()
 
@@ -259,6 +271,8 @@ def main():
         output_name=args.output_name,
         fast_mode=args.fast_mode,
         fast_sim_resolution_ms=args.fast_sim_resolution_ms,
+        n_scaling=args.n_scaling,
+        k_scaling=args.k_scaling,
     )
 
     result_paths = sim.visual_stim(
@@ -290,6 +304,8 @@ def main():
         "data_path": sim.sim_dict["data_path"],
         "presim_ms": sim.sim_dict["t_presim"],
         "result_paths": result_paths,
+        "rng_seed": sim.sim_dict["rng_seed"],
+        "visual_seed": args.seed,
     }
     run_config_path = os.path.join(
         sim.sim_dict["data_path"], f"{args.output_prefix}_run_config.pkl"

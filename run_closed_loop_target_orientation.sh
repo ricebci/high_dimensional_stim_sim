@@ -41,16 +41,31 @@ cd "$(dirname "$0")"
 #     --quiet
 
 
+# python closed_loop_no_encoder_experiment.py \
+#     --closed-loop-interval-ms  1000 \
+#     --same-seed                42 \
+#     --stim-amplitudes-uA       1 2 3 4 5 6\
+#     --n-trials                 4  \
+#     --n-stim-channels          32 \
+#     --n-sessions               8 \
+#     --n-workers                8 \
+#     --output-name              32_stimchannel_1sinterval_no_encoder_run3\
+#     --output-prefix            run3\
+#     --quiet
+
+
+
 python closed_loop_no_encoder_experiment.py \
     --closed-loop-interval-ms  1000 \
     --same-seed                42 \
     --stim-amplitudes-uA       1 2 3 4 5 6\
-    --n-trials                 4  \
-    --n-stim-channels          32 \
-    --n-sessions               8 \
-    --n-workers                8 \
-    --output-name              32_stimchannel_1sinterval_no_encoder_run3\
-    --output-prefix            run3\
+    --n-trials                 1  \
+    --n-stim-channels          128 \
+    --n-sessions               2 \
+    --n-workers                2 \
+    --output-name              128_stimchannel_1000msinterval_noscale\
+    --output-prefix            run1\
+    --k-scaling 1.00 \
+    --n-scaling 1.00 \
+
     --quiet
-
-

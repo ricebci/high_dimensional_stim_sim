@@ -29,6 +29,7 @@ Example
 import copy
 import os
 import pickle
+import warnings
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import nest
@@ -42,30 +43,108 @@ from electrodes_stim import StimElectrodes
 from network_cortcol import Network
 
 # ====================PROBE=====================================================
-volume_v_min = 200  # um
+volume_v_min = 0  # um
 volume_v_max = 1800  # um
 volume_h_min = 0  # um
 volume_h_max = 0   # um
-N_STIM_CHANNELS = 32  # default; actual count set via SystemNESTSim(n_stim_channels=...)
+N_STIM_CHANNELS = 1024  # default; actual count set via SystemNESTSim(n_stim_channels=...)
 
 
-def make_electrode_grid(n_stim_channels: int) -> np.ndarray:
+def make_electrode_grid(n_stim_channels: int, layout: str = "hex") -> np.ndarray:
     """Return (n_stim_channels, 2) array of [h, v] electrode coordinates.
 
-    Electrodes are placed on an evenly-spaced rectangular grid that fills
-    the probe volume defined by ``volume_{v,h}_{min,max}``.  If one axis
-    has zero extent (min == max), all channels are distributed along the
-    other axis only.
+    Parameters
+    ----------
+    n_stim_channels
+        Number of stimulation channels to place.
+    layout
+        "hex" (default) for a staggered hex-like 2-D lattice, or "rect" for
+        the previous rectangular grid behavior. If one axis has zero extent,
+        channels are distributed along the non-collapsed axis regardless of
+        layout.
     """
+    if n_stim_channels <= 0:
+        raise ValueError("n_stim_channels must be > 0")
+
     h_has_extent = (volume_h_max != volume_h_min)
     v_has_extent = (volume_v_max != volume_v_min)
 
     if h_has_extent and v_has_extent:
-        # 2-D grid: factor n_stim_channels into n_h x n_v
-        n_h = int(np.sqrt(n_stim_channels))
-        while n_stim_channels % n_h != 0:
-            n_h -= 1
-        n_v = n_stim_channels // n_h
+        if layout not in {"hex", "rect"}:
+            raise ValueError("layout must be 'hex' or 'rect'")
+
+        if layout == "rect":
+            # 2-D rectangular grid: factor n_stim_channels into n_h x n_v.
+            n_h = int(np.sqrt(n_stim_channels))
+            while n_stim_channels % n_h != 0:
+                n_h -= 1
+            n_v = n_stim_channels // n_h
+
+            h_vals = np.linspace(volume_h_min, volume_h_max, n_h)
+            v_vals = np.linspace(volume_v_min, volume_v_max, n_v)
+            hh, vv = np.meshgrid(h_vals, v_vals)
+            return np.stack([hh.ravel(), vv.ravel()], axis=1)
+
+        # 2-D staggered (hex-like) lattice with exact channel count.
+        width = float(volume_h_max - volume_h_min)
+        height = float(volume_v_max - volume_v_min)
+
+        best = None
+        for n_rows in range(1, n_stim_channels + 1):
+            n_long = int(np.ceil((n_stim_channels + (n_rows // 2)) / n_rows))
+            n_short = max(1, n_long - 1)
+
+            n_long_rows = (n_rows + 1) // 2
+            n_short_rows = n_rows // 2
+            total = n_long_rows * n_long + n_short_rows * n_short
+            if total < n_stim_channels:
+                continue
+
+            dx = width / max(n_long - 1, 1)
+            dy = height / max(n_rows - 1, 1)
+            ideal_dy = dx * (np.sqrt(3.0) / 2.0)
+
+            dy_score = abs(dy - ideal_dy) / max(ideal_dy, 1e-12)
+            overshoot = total - n_stim_channels
+            candidate = (dy_score, overshoot, n_rows, n_long)
+
+            if best is None or candidate < best:
+                best = candidate
+
+        _, _, n_rows, n_long = best
+        n_short = max(1, n_long - 1)
+        dx = width / max(n_long - 1, 1)
+
+        row_counts = [n_long if (r % 2 == 0) else n_short for r in range(n_rows)]
+        surplus = sum(row_counts) - n_stim_channels
+
+        # Trim surplus points from lower rows while keeping >= 1 point per row.
+        for r in range(n_rows - 1, -1, -1):
+            if surplus == 0:
+                break
+            removable = row_counts[r] - 1
+            if removable <= 0:
+                continue
+            drop = min(removable, surplus)
+            row_counts[r] -= drop
+            surplus -= drop
+
+        y_vals = np.linspace(volume_v_min, volume_v_max, n_rows)
+        coords = []
+        for r, (y, count) in enumerate(zip(y_vals, row_counts)):
+            if count == 1:
+                x_vals = np.array([(volume_h_min + volume_h_max) / 2.0])
+            elif r % 2 == 1 and n_long > 1:
+                x_start = volume_h_min + 0.5 * dx
+                x_stop = volume_h_max - 0.5 * dx
+                x_vals = np.linspace(x_start, x_stop, count)
+            else:
+                x_vals = np.linspace(volume_h_min, volume_h_max, count)
+
+            for x in x_vals:
+                coords.append((x, y))
+
+        return np.asarray(coords, dtype=float)
     elif v_has_extent:
         # Only vertical extent: single column
         n_h = 1
@@ -144,6 +223,9 @@ class SystemNESTSim:
         fast_mode: bool = False,
         fast_sim_resolution_ms: Optional[float] = None,
         n_stim_channels: int = 128,
+        n_scaling: Optional[float] = None,
+        k_scaling: Optional[float] = None,
+        rng_seed: Optional[int] = None,
     ):
         """
         Initialize NEST and set up the network.
@@ -163,6 +245,16 @@ class SystemNESTSim:
         n_stim_channels
             Number of stimulation electrodes. Electrode coordinates are
             computed as an evenly-spaced grid within the probe volume.
+        n_scaling
+            Override for N_scaling (neuron count factor). If None, uses the
+            value from network_params.py (default 0.05).
+        k_scaling
+            Override for K_scaling (indegree factor). If None, uses the
+            value from network_params.py (default 0.05).
+        rng_seed
+            Override for the system RNG seed. This seed controls NEST's RNG
+            and neuron placement. If None, uses sim_params.py default (42).
+            This is the single source of truth for all downstream seeds.
         """
         self.window_ms = window_ms
         self.overlap_ms = overlap_ms
@@ -171,6 +263,14 @@ class SystemNESTSim:
         self.net_dict = copy.deepcopy(net_dict)
         self.sim_dict = copy.deepcopy(sim_dict)
         self.stim_dict = copy.deepcopy(stim_dict)
+
+        if rng_seed is not None:
+            self.sim_dict["rng_seed"] = rng_seed
+
+        if n_scaling is not None:
+            self.net_dict["N_scaling"] = n_scaling
+        if k_scaling is not None:
+            self.net_dict["K_scaling"] = k_scaling
 
         if fast_mode:
             fast_resolution = (
@@ -196,7 +296,7 @@ class SystemNESTSim:
         self.sim_dict["data_path"] = os.path.join(base_path, output_name)
         os.makedirs(self.sim_dict["data_path"], exist_ok=True)
 
-        ch_coordinates = make_electrode_grid(n_stim_channels)
+        ch_coordinates = make_electrode_grid(n_stim_channels, layout="hex")
         self.n_stim_channels = n_stim_channels
         self.electrodes = StimElectrodes(
             ch_coordinates,
@@ -392,7 +492,7 @@ class SystemNESTSim:
         baseline_pA: float = 0.0,
         gain_pA: float = 80.0,
         sparsity: float = 0.1,
-        seed: int = 0,
+        seed: Optional[int] = None,
         output_prefix: str = "visual",
         realtime_progress: bool = False,
         progress_step_ms: float = 1000.0,
@@ -418,6 +518,7 @@ class SystemNESTSim:
             Fraction of neurons receiving visual input (0 < sparsity <= 1).
         seed
             Random seed for sparse-neuron and preference sampling.
+            If None, derives from the system RNG seed (sim_dict["rng_seed"]).
         output_prefix
             Prefix used in output pickle filenames.
         realtime_progress
@@ -472,6 +573,8 @@ class SystemNESTSim:
         orientation_array = orientation_array[valid_mask]
         num_steps = len(event_times)
 
+        if seed is None:
+            seed = self.sim_dict["rng_seed"]
         rng = np.random.default_rng(seed)
         num_neurons = self.network.n_neurons
         num_target_neurons = max(1, int(np.round(sparsity * num_neurons)))
@@ -552,6 +655,9 @@ class SystemNESTSim:
                     "target_neuron_indices": target_neuron_indices,
                     "preferred_thetas": preferred_thetas,
                     "event_times_ms": event_times,
+                    "rng_seed": self.sim_dict["rng_seed"],
+                    "visual_seed": seed,
+                    "neuron_locations": self.network.neuron_locations.copy(),
                 },
                 meta_file,
             )
@@ -593,6 +699,33 @@ class SystemNESTSim:
 
         target_neuron_indices = meta["target_neuron_indices"]
         preferred_thetas = meta["preferred_thetas"]
+
+        # Check if the RNG seed used during the original visual stim run
+        # matches the current system seed.  A mismatch means neuron placement
+        # may differ, which would silently mis-route visual currents.
+        saved_seed = meta.get("rng_seed")
+        if saved_seed is not None and saved_seed != self.sim_dict["rng_seed"]:
+            warnings.warn(
+                f"System RNG seed ({self.sim_dict['rng_seed']}) differs from "
+                f"the seed used in the original visual stimulation run "
+                f"({saved_seed}). Neuron placement will differ, so visual "
+                f"current generators may target the wrong neurons.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # If the original run saved neuron locations, verify they match.
+        saved_locations = meta.get("neuron_locations")
+        if saved_locations is not None:
+            if not np.allclose(saved_locations, self.network.neuron_locations):
+                warnings.warn(
+                    "Neuron locations in the current simulation do not match "
+                    "those from the original visual stimulation run. This is "
+                    "likely caused by a different RNG seed or N_scaling. "
+                    "Visual current generators may target the wrong neurons.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         resolution = float(nest.GetKernelStatus("resolution"))
         current_time_ms = self.get_current_biological_time_ms()

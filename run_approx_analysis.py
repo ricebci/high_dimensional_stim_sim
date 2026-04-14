@@ -46,6 +46,8 @@ def parse_args():
                         help="STA window end bin index (default: 14)")
     parser.add_argument("--visual-epoch-ms", type=float, default=70.0,
                         help="Visual epoch duration in ms for spike counting (default: 70.0)")
+    parser.add_argument("--n-scaling", type=float, default=None,
+                        help="Override N_scaling (neuron count factor). Default: use network_params.py value.")
     return parser.parse_args()
 
 
@@ -262,17 +264,30 @@ def make_electrode_grid(data_dir, session_dirs, n_stim_channels):
     return _hh.ravel(), _vv.ravel()
 
 
-def make_neuron_locations():
-    """Reproduce neuron locations from network params."""
+def make_neuron_locations(n_scaling=None, rng_seed=None):
+    """Reproduce neuron locations from network params.
+
+    Must match ``Network.__create_neuronal_populations`` in network_cortcol.py:
+    same RNG seed (sim_params rng_seed) and depth-sorting within each population.
+
+    Parameters
+    ----------
+    n_scaling : float, optional
+        Override N_scaling. If None, uses the value from network_params.py.
+    rng_seed : int, optional
+        Override RNG seed. If None, uses sim_params default.
+    """
     from corcol_params.network_params import net_dict as _net_dict
+    from corcol_params.sim_params import sim_dict as _sim_dict
     _pop_names = _net_dict["populations"]
     _pop_depths = _net_dict["pop_depth_ranges_um"]
     _horiz = _net_dict["pop_horiz_ranges_um"]
     _full_n = _net_dict["full_num_neurons"]
-    _nscale = _net_dict["N_scaling"]
+    _nscale = n_scaling if n_scaling is not None else _net_dict["N_scaling"]
     _num_neurons_per_pop = np.round(_full_n * _nscale).astype(int)
 
-    _rng = np.random.default_rng(seed=0)
+    _seed = rng_seed if rng_seed is not None else _sim_dict["rng_seed"]
+    _rng = np.random.default_rng(seed=_seed)
     neuron_h_all, neuron_v_all = [], []
     for _i, _pname in enumerate(_pop_names):
         _nn = _num_neurons_per_pop[_i]
@@ -280,16 +295,51 @@ def make_neuron_locations():
         _locs[:, 0] = _locs[:, 0] * (_horiz[1] - _horiz[0]) + _horiz[0]
         _d = _pop_depths[_i]
         _locs[:, 1] = _locs[:, 1] * (_d[1] - _d[0]) + _d[0]
+        _locs = _locs[np.argsort(_locs[:, 1])]
         neuron_h_all.append(_locs[:, 0])
         neuron_v_all.append(_locs[:, 1])
 
     return np.concatenate(neuron_h_all), np.concatenate(neuron_v_all)
 
 
+def check_neuron_placement_consistency(neuron_h, neuron_v, metadata_path):
+    """Warn if reconstructed neuron positions don't match saved metadata.
+
+    Parameters
+    ----------
+    neuron_h, neuron_v : np.ndarray
+        Reconstructed neuron horizontal and vertical positions.
+    metadata_path : str
+        Path to a ``*_stim_metadata.pkl`` that may contain ``neuron_locations``.
+    """
+    import warnings
+    if not os.path.isfile(metadata_path):
+        return
+    try:
+        with open(metadata_path, "rb") as f:
+            meta = pickle.load(f)
+    except Exception:
+        return
+    saved_locations = meta.get("neuron_locations")
+    if saved_locations is None:
+        return
+    reconstructed = np.column_stack([neuron_h, neuron_v])
+    if reconstructed.shape != saved_locations.shape or not np.allclose(
+        reconstructed, saved_locations
+    ):
+        warnings.warn(
+            f"Reconstructed neuron positions do not match those saved in "
+            f"{metadata_path}. This may be caused by a different RNG seed or "
+            f"N_scaling. Analysis results may be incorrect.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+
 # ── STA computation ─────────────────────────────────────────────────────
 def compute_stas(spike_bins_arr, history, bin_ms, n_stim_channels,
                  electrode_h, electrode_v, neuron_h_all, neuron_v_all, viz_dir,
-                 window_bin_start=0, window_bin_end=14):
+                 window_bin_start=0, window_bin_end=14, n_scaling=None):
     """Compute STAs and save heatmaps. Returns sta_spkcount dict and pattern_keys."""
     WINDOW_BIN_START, WINDOW_BIN_END = window_bin_start, window_bin_end
     n_intervals, bins_per_interval, n_neurons_total = spike_bins_arr.shape
@@ -314,7 +364,7 @@ def compute_stas(spike_bins_arr, history, bin_ms, n_stim_channels,
     from corcol_params.network_params import net_dict as _nd
     _pop_names_sta = _nd["populations"]
     _full_n_sta = _nd["full_num_neurons"]
-    _nscale_sta = _nd["N_scaling"]
+    _nscale_sta = n_scaling if n_scaling is not None else _nd["N_scaling"]
     _num_per_pop_sta = np.round(_full_n_sta * _nscale_sta).astype(int)
     _pop_boundaries = np.cumsum(_num_per_pop_sta)
     _pop_starts = np.concatenate([[0], _pop_boundaries[:-1]])
@@ -738,7 +788,14 @@ def main():
     # 3. Electrode and neuron locations
     print("\n=== Setting up electrode and neuron locations ===")
     electrode_h, electrode_v = make_electrode_grid(data_dir, session_dirs, n_stim_channels)
-    neuron_h_all, neuron_v_all = make_neuron_locations()
+    neuron_h_all, neuron_v_all = make_neuron_locations(n_scaling=args.n_scaling)
+
+    # Check neuron placement consistency against saved visual metadata
+    _meta_candidates = [f for f in os.listdir(visual_dir) if f.endswith("_stim_metadata.pkl")]
+    for _mf in _meta_candidates:
+        check_neuron_placement_consistency(
+            neuron_h_all, neuron_v_all, os.path.join(visual_dir, _mf)
+        )
 
     # 4. Compute STAs
     print("\n=== Computing STAs ===")
@@ -746,6 +803,7 @@ def main():
         spike_bins_arr, history, bin_ms, n_stim_channels,
         electrode_h, electrode_v, neuron_h_all, neuron_v_all, viz_dir,
         window_bin_start=window_bin_start, window_bin_end=window_bin_end,
+        n_scaling=args.n_scaling,
     )
 
     # 5. Build dictionary matrix A

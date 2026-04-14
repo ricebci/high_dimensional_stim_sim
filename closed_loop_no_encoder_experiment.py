@@ -177,6 +177,55 @@ def parse_args():
         action="store_true",
         help="Suppress NEST kernel output (set verbosity to M_ERROR).",
     )
+    # ── Hyperparameter overrides for grid search ──
+    parser.add_argument(
+        "--psp-exc-mean",
+        type=float,
+        default=None,
+        help="Override mean excitatory PSP (mV). Default: 0.15 from network_params.py.",
+    )
+    parser.add_argument(
+        "--g-inh",
+        type=float,
+        default=None,
+        help="Override relative inhibitory weight (negative). Default: -4 from network_params.py.",
+    )
+    parser.add_argument(
+        "--bg-rate",
+        type=float,
+        default=None,
+        help="Override Poisson background input rate (spikes/s). Default: 8 from network_params.py.",
+    )
+    parser.add_argument(
+        "--dc-amp-extra",
+        type=float,
+        default=0.0,
+        help="Additional DC current (pA) injected into all neurons. Default: 0.",
+    )
+    parser.add_argument(
+        "--volume-v-min",
+        type=float,
+        default=None,
+        help="Override probe volume vertical min (um). Default: 0.",
+    )
+    parser.add_argument(
+        "--volume-v-max",
+        type=float,
+        default=None,
+        help="Override probe volume vertical max (um). Default: 1800.",
+    )
+    parser.add_argument(
+        "--volume-h-min",
+        type=float,
+        default=None,
+        help="Override probe volume horizontal min (um). Default: -380.",
+    )
+    parser.add_argument(
+        "--volume-h-max",
+        type=float,
+        default=None,
+        help="Override probe volume horizontal max (um). Default: 380.",
+    )
     return parser.parse_args()
 
 
@@ -203,6 +252,11 @@ def run_single_session(
     shared_init_counter=None,
     n_scaling: Optional[float] = None,
     k_scaling: Optional[float] = None,
+    psp_exc_mean: Optional[float] = None,
+    g_inh: Optional[float] = None,
+    bg_rate: Optional[float] = None,
+    dc_amp_extra: float = 0.0,
+    volume_bounds: Optional[dict] = None,
 ) -> dict:
     """
     Run a single session of the closed-loop no-encoder experiment.
@@ -265,6 +319,11 @@ def run_single_session(
         n_scaling=n_scaling,
         k_scaling=k_scaling,
         rng_seed=nest_seed,
+        psp_exc_mean=psp_exc_mean,
+        g_inh=g_inh,
+        bg_rate=bg_rate,
+        dc_amp_extra=dc_amp_extra,
+        volume_bounds=volume_bounds,
     )
 
     # Recreate visual current generators if metadata path is provided
@@ -288,6 +347,10 @@ def run_single_session(
         "visual_metadata_path": visual_metadata_path,
         "data_path": sim.sim_dict["data_path"],
         "completed": False,
+        "psp_exc_mean": sim.net_dict["PSP_exc_mean"],
+        "g_inh": sim.net_dict["g"],
+        "bg_rate": sim.net_dict["bg_rate"],
+        "dc_amp_extra": dc_amp_extra,
         "electrode_volume_bounds_um": {
             "v_min": volume_v_min,
             "v_max": volume_v_max,
@@ -359,8 +422,7 @@ def run_session_wrapper(args_tuple):
     if _shared_started_counter is not None:
         with _shared_started_counter.get_lock():
             _shared_started_counter.value += 1
-    # Last three elements are quiet, n_scaling, k_scaling; rest are positional args
-    *positional, quiet, n_scaling, k_scaling = args_tuple
+    *positional, quiet, n_scaling, k_scaling, psp_exc_mean, g_inh, bg_rate, dc_amp_extra, volume_bounds = args_tuple
     return run_single_session(
         *positional,
         quiet=quiet,
@@ -368,6 +430,11 @@ def run_session_wrapper(args_tuple):
         shared_init_counter=_shared_init_counter,
         n_scaling=n_scaling,
         k_scaling=k_scaling,
+        psp_exc_mean=psp_exc_mean,
+        g_inh=g_inh,
+        bg_rate=bg_rate,
+        dc_amp_extra=dc_amp_extra,
+        volume_bounds=volume_bounds,
     )
 
 
@@ -394,6 +461,21 @@ def main():
             f"visual_orientations_8/visual8_stim_metadata.pkl"
         )
 
+    # Build volume_bounds dict from CLI args (None if no overrides given)
+    _vb_args = [args.volume_v_min, args.volume_v_max, args.volume_h_min, args.volume_h_max]
+    if any(v is not None for v in _vb_args):
+        _volume_bounds = {}
+        if args.volume_v_min is not None:
+            _volume_bounds["v_min"] = args.volume_v_min
+        if args.volume_v_max is not None:
+            _volume_bounds["v_max"] = args.volume_v_max
+        if args.volume_h_min is not None:
+            _volume_bounds["h_min"] = args.volume_h_min
+        if args.volume_h_max is not None:
+            _volume_bounds["h_max"] = args.volume_h_max
+    else:
+        _volume_bounds = None
+
     # --- Single session mode ---
     if args.n_sessions == 1:
         result = run_single_session(
@@ -413,6 +495,11 @@ def main():
             quiet=args.quiet,
             n_scaling=args.n_scaling,
             k_scaling=args.k_scaling,
+            psp_exc_mean=args.psp_exc_mean,
+            g_inh=args.g_inh,
+            bg_rate=args.bg_rate,
+            dc_amp_extra=args.dc_amp_extra,
+            volume_bounds=_volume_bounds,
         )
         print("Closed-loop no-encoder experiment complete")
         print("Data path:", result["data_path"])
@@ -461,6 +548,11 @@ def main():
                 args.quiet,
                 args.n_scaling,
                 args.k_scaling,
+                args.psp_exc_mean,
+                args.g_inh,
+                args.bg_rate,
+                args.dc_amp_extra,
+                _volume_bounds,
             )
             for session_id in range(args.n_sessions)
         ]

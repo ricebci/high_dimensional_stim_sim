@@ -45,9 +45,8 @@ from network_cortcol import Network
 # ====================PROBE=====================================================
 volume_v_min = 0  # um
 volume_v_max = 1800  # um
-volume_h_min = 0  # um
-volume_h_max = 0   # um
-N_STIM_CHANNELS = 1024  # default; actual count set via SystemNESTSim(n_stim_channels=...)
+volume_h_min = -380  # um
+volume_h_max = 380   # um
 
 
 def make_electrode_grid(n_stim_channels: int, layout: str = "hex") -> np.ndarray:
@@ -226,6 +225,11 @@ class SystemNESTSim:
         n_scaling: Optional[float] = None,
         k_scaling: Optional[float] = None,
         rng_seed: Optional[int] = None,
+        psp_exc_mean: Optional[float] = None,
+        g_inh: Optional[float] = None,
+        bg_rate: Optional[float] = None,
+        dc_amp_extra: float = 0.0,
+        volume_bounds: Optional[Dict[str, float]] = None,
     ):
         """
         Initialize NEST and set up the network.
@@ -255,6 +259,22 @@ class SystemNESTSim:
             Override for the system RNG seed. This seed controls NEST's RNG
             and neuron placement. If None, uses sim_params.py default (42).
             This is the single source of truth for all downstream seeds.
+        psp_exc_mean
+            Override for mean excitatory PSP (mV). Controls overall synaptic
+            gain. Default from network_params.py is 0.15 mV.
+        g_inh
+            Override for relative inhibitory synaptic weight (negative value).
+            Default from network_params.py is -4.
+        bg_rate
+            Override for Poisson background input rate (spikes/s).
+            Default from network_params.py is 8.
+        dc_amp_extra
+            Additional DC current (pA) injected into all neurons on top of
+            any computed DC compensation. Use to shift the operating point.
+        volume_bounds
+            Override probe volume bounds (um) as a dict with keys
+            ``v_min``, ``v_max``, ``h_min``, ``h_max``.  If None, uses
+            module-level defaults.
         """
         self.window_ms = window_ms
         self.overlap_ms = overlap_ms
@@ -271,6 +291,38 @@ class SystemNESTSim:
             self.net_dict["N_scaling"] = n_scaling
         if k_scaling is not None:
             self.net_dict["K_scaling"] = k_scaling
+
+        # Hyperparameter overrides that require recomputing derived matrices
+        _recompute_psp = False
+        if psp_exc_mean is not None:
+            self.net_dict["PSP_exc_mean"] = psp_exc_mean
+            _recompute_psp = True
+        if g_inh is not None:
+            self.net_dict["g"] = g_inh
+            _recompute_psp = True
+        if _recompute_psp:
+            from corcol_params.network_params import get_exc_inh_matrix
+            num_pops = len(self.net_dict["populations"])
+            psp_mat = get_exc_inh_matrix(
+                self.net_dict["PSP_exc_mean"],
+                self.net_dict["PSP_exc_mean"] * self.net_dict["g"],
+                num_pops,
+            )
+            psp_mat[0, 2] = 2.0 * self.net_dict["PSP_exc_mean"]  # L4E→L23E doubled
+            self.net_dict["PSP_matrix_mean"] = psp_mat
+
+        if bg_rate is not None:
+            self.net_dict["bg_rate"] = bg_rate
+
+        self._dc_amp_extra = dc_amp_extra
+
+        # Override module-level probe volume bounds if provided
+        global volume_v_min, volume_v_max, volume_h_min, volume_h_max
+        if volume_bounds is not None:
+            volume_v_min = volume_bounds.get("v_min", volume_v_min)
+            volume_v_max = volume_bounds.get("v_max", volume_v_max)
+            volume_h_min = volume_bounds.get("h_min", volume_h_min)
+            volume_h_max = volume_bounds.get("h_max", volume_h_max)
 
         if fast_mode:
             fast_resolution = (
@@ -306,6 +358,16 @@ class SystemNESTSim:
 
         self.network = Network(self.sim_dict, self.net_dict, self.stim_dict)
         self.network.create()
+
+        # Apply extra DC bias to shift operating point of all neurons
+        if self._dc_amp_extra != 0.0:
+            for pop in self.network.pops:
+                current_Ie = pop.get("I_e")
+                if isinstance(current_Ie, (list, np.ndarray)):
+                    pop.set(I_e=np.array(current_Ie) + self._dc_amp_extra)
+                else:
+                    pop.set(I_e=current_Ie + self._dc_amp_extra)
+
         self.network.connect()
         self.network.simulate_baseline(self.sim_dict["t_presim"])
 
@@ -332,8 +394,8 @@ class SystemNESTSim:
     ):
         if not (len(channels) == len(times_ms) == len(amplitudes_uA)):
             raise ValueError("channels, times_ms, amplitudes_uA must have equal length")
-        if np.any(channels < 0) or np.any(channels >= N_STIM_CHANNELS):
-            raise ValueError(f"Channel indices must be in [0, {N_STIM_CHANNELS - 1}]")
+        if np.any(channels < 0) or np.any(channels >= self.n_stim_channels):
+            raise ValueError(f"Channel indices must be in [0, {self.n_stim_channels - 1}]")
         if np.any(times_ms < 0):
             raise ValueError("times_ms must be non-negative")
         if np.any(amplitudes_uA < 0):

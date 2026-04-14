@@ -55,17 +55,42 @@ cd "$(dirname "$0")"
 
 
 
-python closed_loop_no_encoder_experiment.py \
-    --closed-loop-interval-ms  1000 \
-    --same-seed                42 \
-    --stim-amplitudes-uA       1 2 3 4 5 6\
-    --n-trials                 1  \
-    --n-stim-channels          128 \
-    --n-sessions               2 \
-    --n-workers                2 \
-    --output-name              128_stimchannel_1000msinterval_noscale\
-    --output-prefix            run1\
-    --k-scaling 1.00 \
-    --n-scaling 1.00 \
+# ── Hyperparameters (edit these) ──────────────────────────────────────────────
+# Synaptic / network
+PSP_EXC_MEAN=""          # mean excitatory PSP (mV); empty = default 0.15
+G_INH=""                 # relative inhibitory weight; empty = default -4
+BG_RATE=""               # Poisson background rate (spikes/s); empty = default 8
+DC_AMP_EXTRA="0.0"       # extra DC current (pA) injected into all neurons
 
+# Probe volume bounds (um); empty = defaults (v: 0–1800, h: -380–380)
+VOLUME_V_MIN=""
+VOLUME_V_MAX=""
+VOLUME_H_MIN=""
+VOLUME_H_MAX=""
+
+# ── Build command ─────────────────────────────────────────────────────────────
+CMD=(python closed_loop_no_encoder_experiment.py
+    --closed-loop-interval-ms  250
+    --same-seed                42
+    --stim-amplitudes-uA       6
+    --n-trials                 2
+    --n-stim-channels          32
+    --n-sessions               1
+    --n-workers                1
+    --output-name              32_stimchannel_250msinterval_noscale_minimal_l4question
+    --output-prefix            run1
+    --k-scaling 1.00
+    --n-scaling 1.00
+    --dc-amp-extra "$DC_AMP_EXTRA"
     --quiet
+)
+
+[[ -n "$PSP_EXC_MEAN" ]]  && CMD+=(--psp-exc-mean  "$PSP_EXC_MEAN")
+[[ -n "$G_INH" ]]          && CMD+=(--g-inh         "$G_INH")
+[[ -n "$BG_RATE" ]]        && CMD+=(--bg-rate        "$BG_RATE")
+[[ -n "$VOLUME_V_MIN" ]]   && CMD+=(--volume-v-min  "$VOLUME_V_MIN")
+[[ -n "$VOLUME_V_MAX" ]]   && CMD+=(--volume-v-max  "$VOLUME_V_MAX")
+[[ -n "$VOLUME_H_MIN" ]]   && CMD+=(--volume-h-min  "$VOLUME_H_MIN")
+[[ -n "$VOLUME_H_MAX" ]]   && CMD+=(--volume-h-max  "$VOLUME_H_MAX")
+
+"${CMD[@]}"
